@@ -1,4 +1,4 @@
 server:
 	go build -o bin/server cmd/server/main.go && ./bin/server --replica=3
 client:
-	go build -o bin/client cmd/client/main.go && ./bin/client
+	go build -o bin/client cmd/client/main.go && ./bin/client --node=1234 --request=3001

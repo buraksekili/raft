@@ -77,6 +77,7 @@ type Server struct {
 	ID string
 
 	// ServerIds corresponds to array of IDs of other servers in the cluster.
+	// Used to know RPC server addresses of other servers if needed.
 	ServerIds []string
 
 	// serverClients corresponds to the map of string and rpc.Client that includes
@@ -94,20 +95,21 @@ type Server struct {
 	// RPCs from a leader or candidate
 	//state serverState
 
-	L *logger
+	L *Logger
 }
 
 // RPC sends RPC request to the server identified with nodeId by using rpc.Client that is
 // created while dialing that server.
 func (s *Server) RPC(nodeId, rpcMethod string, args, reply interface{}) error {
-	//rpcClient, ok := s.serverClients[nodeId]
-	//if !ok {
-	//return fmt.Errorf("failed to find RPC client for node: %v", nodeId)
-	//}
+	rpcClient, ok := s.serverClients[nodeId]
+	if !ok {
+		var err error
+		rpcClient, err = rpc.DialHTTP("tcp", fmt.Sprintf("127.0.0.1:%v", nodeId))
+		if err != nil {
+			return err
+		}
 
-	rpcClient, err := rpc.DialHTTP("tcp", fmt.Sprintf("127.0.0.1:%v", nodeId))
-	if err != nil {
-		return err
+		s.serverClients[nodeId] = rpcClient
 	}
 
 	return rpcClient.Call(rpcMethod, args, reply)
@@ -125,7 +127,7 @@ func NewServer(id string, serverIds []string) *Server {
 		serverClients: make(map[string]*rpc.Client),
 	}
 
-	l := &logger{server: s}
+	l := &Logger{Server: s}
 	s.L = l
 	s.Raft.L = l
 	s.Raft.Server = s
@@ -217,7 +219,7 @@ func (s *Server) requestVote(candidateTerm int, candidateId string, lastLogIdx, 
 
 	term = s.Raft.PersistentState.CurrentTerm
 
-	log(s, "Response: %v to RequestVote RPC in %v from %v", voteGranted, s.ID, candidateId)
+	log(s, "Response: %v to RequestVote RPC from %v", voteGranted, candidateId)
 
 	return
 }
@@ -230,6 +232,11 @@ func (s *Server) appendEntries(req *AppendEntriesReq) (term int, success bool) {
 
 	term = s.Raft.PersistentState.CurrentTerm
 	s.L.log("received AppendEntriesRPC")
+
+	if req.Term > s.Raft.PersistentState.CurrentTerm {
+		s.L.log("found a server with greater term, becoming follower")
+		s.Raft.setFollower(req.Term)
+	}
 
 	if req.Term == s.Raft.PersistentState.CurrentTerm && (s.Raft.State == candidate || s.Raft.State == Follower) {
 		s.Raft.State = Follower
@@ -263,4 +270,62 @@ func (s *Server) appendEntries(req *AppendEntriesReq) (term int, success bool) {
 func (s *Server) setLeader() {
 	s.Raft.State = leader
 	log(s, "i am the new leader")
+}
+
+func (s *Server) addNewServer(newServer *Server) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if newServer.ID == s.ID {
+		s.L.log("server already exists")
+		return nil
+	}
+
+	s.ServerIds = appendIfNotExists(s.ServerIds, newServer.ID)
+
+	newServersClient, err := rpc.DialHTTP("tcp", fmt.Sprintf(":%v", newServer.ID))
+	if err != nil {
+		return err
+	}
+	s.serverClients[newServer.ID] = newServersClient
+
+	for _, serverId := range s.ServerIds {
+		if serverId != s.ID {
+			req := new(AddNewServerReq)
+			res := new(AddNewServerRes)
+			req.NewServerID = newServer.ID
+			req.BaseServerID = serverId
+
+			if err = s.RPC(serverId, addNewServerRpcMethodName, req, res); err != nil {
+				return fmt.Errorf("failed to add the server")
+			}
+		}
+	}
+
+	s.L.log("added %v", newServer.ID)
+
+	return nil
+}
+
+func appendIfNotExists(servers []string, newServerId string) []string {
+	if newServerId == "" {
+		return servers
+	}
+
+	exists := false
+	for _, server := range servers {
+		if server == "" {
+			continue
+		}
+
+		if newServerId == server {
+			exists = true
+		}
+	}
+
+	if !exists {
+		servers = append(servers, newServerId)
+	}
+
+	return servers
 }

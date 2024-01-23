@@ -14,7 +14,7 @@ import (
 // use Server as Raft struct only implements consensus algorithm.
 type Raft struct {
 	mu sync.RWMutex
-	L  *logger
+	L  *Logger
 
 	// State corresponds to states of the server that this Raft owns
 	// The server has three states; follower, candidate or leader.
@@ -40,7 +40,7 @@ type Raft struct {
 func (r *Raft) runElectionTimeout() {
 	r.mu.RLock()
 	electionTimeout := randomTimeout(r.minTimeout, r.maxTimeout)
-	//r.L.log("timeout: %v", electionTimeout)
+	r.L.log("timeout: %v", electionTimeout)
 	r.mu.RUnlock()
 	//r.L.log("resetElectionTimer: %v", r.ResetElectionTimer)
 
@@ -152,14 +152,13 @@ func (r *Raft) sendHeartbeat() {
 
 	for _, serverId := range r.Server.ServerIds {
 		if serverId != r.Server.ID {
-			time.Sleep(1 * time.Second)
+			time.Sleep(100 * time.Millisecond)
 			req := AppendEntriesReq{
 				Term:     lockedTerm,
 				LeaderID: r.Server.ID,
 			}
 			res := AppendEntriesRes{}
 
-			log(r.Server, "sending heartbeat to %v", serverId)
 			if err := r.Server.RPC(serverId, appendentriesRpcMethodname, &req, &res); err != nil {
 				r.L.err("failed to send %v to serverId: %v, err: %v", appendentriesRpcMethodname, serverId, err)
 				return
@@ -177,6 +176,10 @@ func (r *Raft) sendHeartbeat() {
 func randomTimeout(min, max int) time.Duration {
 	randNumber := rand.Intn(min) + (max - min)
 	//return time.Duration(randNumber) * time.Millisecond
-	to := randNumber % 10
+	to := randNumber % 4
+	if to == 0 {
+		to += 1
+	}
+
 	return time.Duration(to) * time.Millisecond * 1000
 }
