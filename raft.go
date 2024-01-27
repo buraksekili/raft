@@ -1,94 +1,62 @@
 package raft
 
 import (
+	"fmt"
+	"log"
 	"math/rand"
+	"net/rpc"
 	"sync"
 	"time"
 )
 
-// Raft corresponds to the consensus module shown in
-// Raft paper (State machine architecture).
-// The fields are needed by consensus algorithm to work.
-// The field exposes methods purely for consensus algorithm.
-// The communication with other servers (nodes) in the cluster,
-// use Server as Raft struct only implements consensus algorithm.
-type Raft struct {
-	mu sync.RWMutex
-	L  *Logger
-
-	// State corresponds to states of the server that this Raft owns
-	// The server has three states; follower, candidate or leader.
-	State              ServerState
-	ResetElectionTimer time.Time
-
-	Server *Server
-
-	// persistentState on all servers.
-	// update them on stable storage before responding to RPCs.
-	PersistentState Persistent
-
-	// persistentState on servers (including the ones for leaders).
-	VolatileState Volatile
-
-	minTimeout int
-	maxTimeout int
+type raftState string
+type logEntry struct {
+	term int
 }
 
-// electionTimeout runs a timer for election timeout and based on that it might start a new election.
-// If a follower receives no communication over a period of time called the election timeout,
-// then it assumes there is no viable leader and begins an election to choose a new leader.
-func (r *Raft) runElectionTimeout() {
-	r.mu.RLock()
-	electionTimeout := randomTimeout(r.minTimeout, r.maxTimeout)
-	r.L.log("timeout: %v", electionTimeout)
-	r.mu.RUnlock()
-	//r.L.log("resetElectionTimer: %v", r.ResetElectionTimer)
+const (
+	followerState  raftState = "follower"
+	candidateState raftState = "candidate"
+	leaderState    raftState = "leader"
+)
 
-	t := time.NewTicker(500 * time.Millisecond)
-	defer t.Stop()
-	for {
-		<-t.C
-		//r.L.log("LEADER IS ALIVE")
-
-		elapsed := time.Since(r.ResetElectionTimer)
-		//r.L.log("elapsed %v\tt/o %v", elapsed.Seconds(), electionTimeout)
-		if elapsed > electionTimeout {
-			log(r.Server, "Failed to get heart beat from leader, timeout elapsed, starting election")
-
-			//	If election timeout elapses without receiving AppendEntries
-			//	RPC from current leader or granting vote to candidate:
-			//	convert to candidate.
-			r.State = candidate
-			//r.Server.CurrentTerm++
-			r.startElection()
-			return
-		}
+func NewNode(id string, cluster []string) *Node {
+	return &Node{
+		id:              id,
+		cluster:         cluster,
+		serverClients:   make(map[string]*rpc.Client),
+		electionTimeout: 1 * time.Second,
+		state:           followerState,
 	}
-
 }
 
-func (r *Raft) startElection() {
-	// • On conversion to candidate, start election:
-	//	• Increment CurrentTerm
-	//	• Vote for self
-	//	• Reset election timer
-	//	• Send RequestVote RPCs to all other servers
-	log(r.Server, "election will start, cluster size: %v", len(r.Server.ServerIds))
+type Node struct {
+	mu          sync.RWMutex
+	id          string
+	currentTerm int
+	state       raftState
+	votedFor    string
+	cluster     []string
+	totalVote   int
+	running     bool
+	log         []logEntry
 
-	r.PersistentState.CurrentTerm++
-	r.PersistentState.VotedFor = r.Server.ID
-	r.ResetElectionTimer = time.Now()
-
-	r.sendRequestVoteRPC()
+	// stateStartTime corresponds to time of when this Node starts
+	// functioning as state.
+	stateStartTime  time.Time
+	electionTimeout time.Duration
+	serverClients   map[string]*rpc.Client
 }
 
-func (r *Raft) sendRequestVoteRPC() {
-	initialTerm := r.Server.Raft.PersistentState.CurrentTerm
-	lastLogIdx := len(r.PersistentState.Log) - 1
+// sendRequestVote sends RequestVote RPC to other servers.
+// The function is locked by mutex.
+func (n *Node) sendRequestVote() {
+	initialTerm := n.currentTerm
+	lastLogIdx := len(n.log) - 1
 
 	lastLogTerm := 0
 	if lastLogIdx > -1 {
-		lastLogTerm = r.PersistentState.Log[lastLogIdx].Term
+		lastLogTerm = n.log[lastLogIdx].term
 	} else if lastLogIdx < 0 {
 		lastLogIdx = 0
 	}
@@ -96,7 +64,7 @@ func (r *Raft) sendRequestVoteRPC() {
 	// Invoked by candidates to gather votes
 	req := new(RequestVoteReq)
 	req.CandidateTerm = initialTerm
-	req.CandidateId = r.Server.ID
+	req.CandidateId = n.id
 	req.LastLogIdx = lastLogIdx
 	req.LastLogTerm = lastLogTerm
 
@@ -105,19 +73,19 @@ func (r *Raft) sendRequestVoteRPC() {
 	// initially is 1 since 1 vote coming from the candidate itself
 	totalVotes := 1
 
-	for _, serverId := range r.Server.ServerIds {
-		if serverId != r.Server.ID {
-			if err := r.Server.RPC(serverId, requestvoteRpcMethodname, req, &res); err != nil {
-				r.L.err("failed to send %v to serverId: %v, err: %v", requestvoteRpcMethodname, serverId, err)
+	for _, serverId := range n.cluster {
+		if serverId != n.id {
+			if err := n.rpc(serverId, requestvoteRpcMethodname, req, res); err != nil {
+				n.err("failed to send %v to serverId: %v, err: %v", requestvoteRpcMethodname, serverId, err)
 				return
 			}
 
-			if r.State != candidate {
+			if n.state != candidateState {
 				return
 			}
 
 			if res.Term > initialTerm {
-				r.setFollower(res.Term)
+				n.setFollower(res.Term)
 				return
 			}
 
@@ -129,57 +97,135 @@ func (r *Raft) sendRequestVoteRPC() {
 		}
 	}
 
-	if totalVotes >= (len(r.Server.ServerIds)+1)/2 {
-		log(r.Server, "WON THE ELECTION")
-		r.Server.setLeader()
+	if totalVotes >= (len(n.cluster)+1)/2 {
+		n.setLeader()
 		return
 	}
-
 }
 
-func (r *Raft) setFollower(newTerm int) {
-	r.State = Follower
-	r.Server.Raft.PersistentState.CurrentTerm = newTerm
-	r.PersistentState.VotedFor = ""
-	r.ResetElectionTimer = time.Now()
+func (n *Node) sendHeartbeat() {
+	n.l("sending heartbeat")
 }
 
-// sendHeartbeat sends empty AppendEntries RPC call to all other servers
-func (r *Raft) sendHeartbeat() {
-	r.mu.Lock()
-	lockedTerm := r.Server.Raft.PersistentState.CurrentTerm
-	r.mu.Unlock()
+// if timeout passes, start leader election. otherwise, do not start leader election.
+func (n *Node) startLeaderElection() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if time.Since(n.stateStartTime) > n.electionTimeout {
+		n.l("election will start, cluster size: %v", len(n.cluster))
+		n.currentTerm++
+		n.votedFor = n.id
+		n.stateStartTime = time.Now()
+		n.sendRequestVote()
+	}
+}
 
-	for _, serverId := range r.Server.ServerIds {
-		if serverId != r.Server.ID {
-			time.Sleep(100 * time.Millisecond)
-			req := AppendEntriesReq{
-				Term:     lockedTerm,
-				LeaderID: r.Server.ID,
+// start runs a new goroutine within a new infinite loop where Raft logic runs periodically (based on electionTimeout).
+func (n *Node) start() error {
+	n.cluster = appendIfNotExists(n.cluster, n.id)
+	c := make(chan error)
+
+	go func() {
+		n.mu.Lock()
+		n.running = true
+		n.mu.Unlock()
+
+		t := time.NewTicker(time.Duration(rand.Intn(800)+600) * time.Millisecond)
+		defer t.Stop()
+		for {
+			n.mu.Lock()
+			n.stateStartTime = time.Now()
+			<-t.C
+			s := n.state
+			if !n.running {
+				n.mu.Unlock()
+				c <- fmt.Errorf("node [%v] is not running", n.id)
 			}
-			res := AppendEntriesRes{}
+			n.mu.Unlock()
 
-			if err := r.Server.RPC(serverId, appendentriesRpcMethodname, &req, &res); err != nil {
-				r.L.err("failed to send %v to serverId: %v, err: %v", appendentriesRpcMethodname, serverId, err)
-				return
+			switch s {
+			case followerState:
+				n.l("i am follower")
+				n.startLeaderElection()
+			case candidateState:
+				n.startLeaderElection()
+			case leaderState:
+				n.l("i am leader")
+				n.sendHeartbeat()
 			}
+		}
+	}()
 
-			if res.Term > lockedTerm {
-				r.setFollower(res.Term)
-			}
+	return <-c
+}
 
+func (n *Node) Start() error {
+	return n.start()
+}
+
+func (n *Node) l(msg string, args ...interface{}) {
+	msg = fmt.Sprintf("id: #%v\tstate: %v\tterm: %v\tmsg: %v\n",
+		n.id, n.state, n.currentTerm, msg,
+	)
+
+	log.Printf(msg, args...)
+}
+
+func (n *Node) err(msg string, args ...interface{}) {
+	msg = fmt.Sprintf("[ERROR] id: #%v\tstate: %v\tterm: %v\tmsg: %v\n",
+		n.id, n.state, n.currentTerm, msg,
+	)
+
+	log.Printf(msg, args...)
+}
+
+func (n *Node) rpc(nodeId, rpcMethod string, args, reply interface{}) error {
+	rpcClient, ok := n.serverClients[nodeId]
+	if !ok {
+		var err error
+		rpcClient, err = rpc.DialHTTP("tcp", fmt.Sprintf("127.0.0.1:%v", nodeId))
+		if err != nil {
+			return err
+		}
+
+		n.serverClients[nodeId] = rpcClient
+	}
+
+	return rpcClient.Call(rpcMethod, args, reply)
+}
+
+func (n *Node) setFollower(newTerm int) {
+	n.state = followerState
+	n.currentTerm = newTerm
+	n.votedFor = ""
+	n.stateStartTime = time.Now()
+}
+
+func (n *Node) setLeader() {
+	n.l("WON THE ELECTION")
+	n.state = leaderState
+	n.stateStartTime = time.Now()
+}
+
+func appendIfNotExists(servers []string, newServerId string) []string {
+	if newServerId == "" {
+		return servers
+	}
+
+	exists := false
+	for _, server := range servers {
+		if server == "" {
+			continue
+		}
+
+		if newServerId == server {
+			exists = true
 		}
 	}
-}
 
-// randomTimeout returns random time out between min and max in ms.
-func randomTimeout(min, max int) time.Duration {
-	randNumber := rand.Intn(min) + (max - min)
-	//return time.Duration(randNumber) * time.Millisecond
-	to := randNumber % 4
-	if to == 0 {
-		to += 1
+	if !exists {
+		servers = append(servers, newServerId)
 	}
 
-	return time.Duration(to) * time.Millisecond * 1000
+	return servers
 }
