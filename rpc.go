@@ -30,5 +30,25 @@ type AppendEntriesRes struct {
 }
 
 const (
-	requestvoteRpcMethodname = ""
+	requestvoteRpcMethodname   = "Node.RequestVote"
+	appendEntriesRpcMethodname = "Node.AppendEntries"
 )
+
+func (n *Node) RequestVote(req *RequestVoteReq, reply *RequestVoteRes) error {
+	currentTerm, voteGranted := n.processRequestVote(req.CandidateId, req.CandidateTerm, req.LastLogIdx, req.LastLogTerm)
+
+	reply.Term = currentTerm
+	reply.VoteGranted = voteGranted
+
+	return nil
+}
+
+func (n *Node) AppendEntries(req *AppendEntriesReq, reply *AppendEntriesRes) error {
+	if reply == nil {
+		reply = new(AppendEntriesRes)
+	}
+
+	n.processAppendEntries(req)
+
+	return nil
+}
