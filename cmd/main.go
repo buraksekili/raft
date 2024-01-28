@@ -2,11 +2,16 @@ package main
 
 import (
 	"fmt"
+	_ "net/http/pprof"
+
+	"github.com/pkg/profile"
 
 	"github.com/buraksekili/raft"
 )
 
 func main() {
+	defer profile.Start(profile.MemProfile, profile.MemProfileRate(1), profile.ProfilePath(".")).Stop()
+
 	var nodeCluster []*raft.Node
 	nodeAddrs := []string{"3000", "3001", "3002"}
 

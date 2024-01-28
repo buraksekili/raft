@@ -108,25 +108,32 @@ func (n *Node) sendRequestVote() {
 
 func (n *Node) sendHeartbeat() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	t := time.NewTicker(200 * time.Millisecond)
+	defer t.Stop()
+	n.mu.Unlock()
 
 	for _, serverId := range n.cluster {
 		if serverId != n.id {
+			<-t.C
 			go func(id string) {
-				req := AppendEntriesReq{
-					Term:     n.currentTerm,
-					LeaderID: n.id,
-				}
-				res := AppendEntriesRes{}
-				time.Sleep(100 * time.Millisecond)
-				if err := n.rpc(id, appendEntriesRpcMethodname, &req, &res); err != nil {
+				n.mu.Lock()
+				res := new(AppendEntriesRes)
+				req := new(AppendEntriesReq)
+				req.Term = n.currentTerm
+				req.LeaderID = n.id
+				n.mu.Unlock()
+
+				if err := n.rpc(id, appendEntriesRpcMethodname, req, res); err != nil {
 					n.err("failed to send %v to serverId: %v, err: %v", appendEntriesRpcMethodname, id, err)
 					return
 				}
 
+				n.mu.Lock()
 				if res.Term > n.currentTerm {
 					n.setFollower(res.Term)
 				}
+				n.mu.Unlock()
+				return
 			}(serverId)
 		}
 	}
@@ -238,16 +245,20 @@ func (n *Node) err(msg string, args ...interface{}) {
 }
 
 func (n *Node) rpc(nodeId, rpcMethod string, args, reply interface{}) error {
+	n.mu.Lock()
 	rpcClient, ok := n.serverClients[nodeId]
+
 	if !ok {
 		var err error
 		rpcClient, err = rpc.DialHTTP("tcp", fmt.Sprintf("127.0.0.1:%v", nodeId))
 		if err != nil {
+			n.mu.Unlock()
 			return err
 		}
 
 		n.serverClients[nodeId] = rpcClient
 	}
+	n.mu.Unlock()
 
 	return rpcClient.Call(rpcMethod, args, reply)
 }
