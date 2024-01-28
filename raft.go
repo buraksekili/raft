@@ -62,6 +62,12 @@ func (n *Node) sendRequestVote() {
 
 	res := new(RequestVoteRes)
 
+	if len(n.cluster) == 1 && n.cluster[0] == n.id {
+		n.l("i am the only node in the cluster, becoming the leader")
+		n.setLeader()
+		return
+	}
+
 	// initially is 1 since 1 vote coming from the candidate itself
 	totalVotes := 1
 
