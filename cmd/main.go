@@ -41,6 +41,8 @@ func main() {
 			}
 		}(node)
 	}
+
+	panic(<-ch)
 }
 
 func getNodeAddrs(n int) (res []string) {
