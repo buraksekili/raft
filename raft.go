@@ -9,6 +9,8 @@ import (
 	"net/rpc"
 	"sync"
 	"time"
+
+	"github.com/buraksekili/raft/internal"
 )
 
 type raftState string
@@ -182,6 +184,7 @@ func (n *Node) start() error {
 	if err != nil {
 		return err
 	}
+
 	stop := make(chan error)
 	stopReporter := make(chan error)
 
@@ -192,6 +195,17 @@ func (n *Node) start() error {
 			return
 		}
 	}()
+
+	for _, nodeAddr := range n.cluster {
+		if nodeAddr != n.id {
+			client, err := internal.RetryRPCDial(fmt.Sprintf("127.0.0.1:%v", nodeAddr))
+			if err != nil {
+				return err
+			}
+
+			n.serverClients[nodeAddr] = client
+		}
+	}
 
 	go func() {
 		t := time.NewTicker(5 * time.Second)
@@ -272,16 +286,9 @@ func (n *Node) err(msg string, args ...interface{}) {
 func (n *Node) rpc(nodeId, rpcMethod string, args, reply interface{}) error {
 	n.mu.Lock()
 	rpcClient, ok := n.serverClients[nodeId]
-
 	if !ok {
-		var err error
-		rpcClient, err = rpc.DialHTTP("tcp", fmt.Sprintf("127.0.0.1:%v", nodeId))
-		if err != nil {
-			n.mu.Unlock()
-			return err
-		}
-
-		n.serverClients[nodeId] = rpcClient
+		n.mu.Unlock()
+		return fmt.Errorf("RPC Client not initialized yet")
 	}
 	n.mu.Unlock()
 
@@ -402,6 +409,20 @@ func (n *Node) shutdown() {
 	n.currentTerm = 0
 }
 
+func (n *Node) Disconnect(nodeId string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	c, ok := n.serverClients[nodeId]
+	if !ok {
+		return
+	}
+
+	c.Close()
+
+	n.serverClients[nodeId] = nil
+}
+
 func appendIfNotExists(servers []string, newServerId string) []string {
 	if newServerId == "" {
 		return servers
@@ -427,11 +448,10 @@ func appendIfNotExists(servers []string, newServerId string) []string {
 
 func NewNode(id string, cluster []string) *Node {
 	return &Node{
-		id:            id,
-		cluster:       cluster,
-		serverClients: make(map[string]*rpc.Client),
-		// [1100, 1500)
-		electionTimeout: time.Duration(rand.Intn(1500)+3000) * time.Millisecond,
+		id:              id,
+		cluster:         cluster,
+		serverClients:   make(map[string]*rpc.Client),
+		electionTimeout: time.Duration(rand.Intn(400)+600) * time.Millisecond,
 		state:           followerState,
 	}
 }
