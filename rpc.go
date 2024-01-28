@@ -7,7 +7,6 @@ type RequestVoteReq struct {
 	LastLogTerm   int
 }
 type RequestVoteRes struct {
-	Res         string
 	Term        int
 	VoteGranted bool
 }
