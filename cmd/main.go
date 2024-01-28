@@ -4,9 +4,8 @@ import (
 	"fmt"
 	_ "net/http/pprof"
 
-	"github.com/pkg/profile"
-
 	"github.com/buraksekili/raft"
+	"github.com/pkg/profile"
 )
 
 func main() {
