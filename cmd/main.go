@@ -41,8 +41,6 @@ func main() {
 			}
 		}(node)
 	}
-
-	fmt.Println("failed to start node, err: ", <-ch)
 }
 
 func getNodeAddrs(n int) (res []string) {

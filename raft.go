@@ -180,25 +180,35 @@ func (n *Node) start() error {
 
 	l, err := net.Listen("tcp", fmt.Sprintf(":%v", n.id))
 	if err != nil {
-		panic(err)
+		return err
 	}
-
-	go http.Serve(l, mux)
-
 	stop := make(chan error)
+	stopReporter := make(chan error)
+
+	go func() {
+		if err := http.Serve(l, mux); err != nil {
+			stop <- err
+			stopReporter <- err
+			return
+		}
+	}()
 
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
-		for {
+		run := true
+		for run {
 			select {
-			case <-stop:
-				fmt.Println("stopping reporter")
-				break
 			case <-t.C:
 				n.report()
+			case <-stopReporter:
+				n.l("stopping reporter since the node has stopped")
+				run = false
+				break
 			}
 		}
+
+		return
 	}()
 
 	go func() {
@@ -210,6 +220,12 @@ func (n *Node) start() error {
 		for {
 			n.mu.Lock()
 			s := n.state
+			if n.running == false {
+				stopReporter <- fmt.Errorf("stopping current node %v", n.id)
+				n.shutdown()
+				n.mu.Unlock()
+				break
+			}
 			n.mu.Unlock()
 
 			switch s {
@@ -221,6 +237,9 @@ func (n *Node) start() error {
 				n.sendHeartbeat()
 			}
 		}
+
+		n.l("exiting...")
+		return
 	}()
 
 	return <-stop
@@ -284,6 +303,10 @@ func (n *Node) setLeader() {
 
 func (n *Node) Start() error {
 	return n.start()
+}
+
+func (n *Node) Stop() {
+	n.running = false
 }
 
 func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx, lastLogTerm int) (int, bool) {
@@ -370,6 +393,13 @@ func (n *Node) processAppendEntries(req *AppendEntriesReq) (term int, success bo
 	}
 
 	return 0, false
+}
+
+func (n *Node) shutdown() {
+	n.l("shutting down...")
+	n.running = false
+	n.state = followerState
+	n.currentTerm = 0
 }
 
 func appendIfNotExists(servers []string, newServerId string) []string {
