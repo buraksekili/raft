@@ -5,7 +5,6 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
 	"net/rpc"
 	"sync"
 	"time"
@@ -40,6 +39,7 @@ type Node struct {
 	stateStartTime  time.Time
 	electionTimeout time.Duration
 	serverClients   map[string]*rpc.Client
+	listener        net.Listener
 }
 
 // sendRequestVote sends RequestVote RPC to other servers.
@@ -55,15 +55,6 @@ func (n *Node) sendRequestVote() {
 		lastLogIdx = 0
 	}
 
-	// Invoked by candidates to gather votes
-	req := new(RequestVoteReq)
-	req.CandidateTerm = initialTerm
-	req.CandidateId = n.id
-	req.LastLogIdx = lastLogIdx
-	req.LastLogTerm = lastLogTerm
-
-	res := new(RequestVoteRes)
-
 	if len(n.cluster) == 1 && n.cluster[0] == n.id {
 		n.l("i am the only node in the cluster, becoming the leader")
 		n.setLeader()
@@ -72,6 +63,15 @@ func (n *Node) sendRequestVote() {
 
 	// initially is 1 since 1 vote coming from the candidate itself
 	totalVotes := 1
+
+	// Invoked by candidates to gather votes
+	req := new(RequestVoteReq)
+	req.CandidateTerm = initialTerm
+	req.CandidateId = n.id
+	req.LastLogIdx = lastLogIdx
+	req.LastLogTerm = lastLogTerm
+
+	res := new(RequestVoteRes)
 
 	for _, serverId := range n.cluster {
 		if serverId != n.id {
@@ -170,29 +170,27 @@ func (n *Node) startLeaderElection() {
 
 // start runs a new goroutine within a new infinite loop where Raft logic runs periodically (based on electionTimeout).
 func (n *Node) start() error {
+	n.mu.Lock()
 	n.cluster = appendIfNotExists(n.cluster, n.id)
 
 	serv := rpc.NewServer()
 	serv.Register(n)
-	oldMux := http.DefaultServeMux
-	mux := http.NewServeMux()
-	http.DefaultServeMux = mux
-	serv.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath)
-	http.DefaultServeMux = oldMux
 
 	l, err := net.Listen("tcp", fmt.Sprintf(":%v", n.id))
 	if err != nil {
 		return err
 	}
 
+	n.listener = l
+
 	stop := make(chan error)
 	stopReporter := make(chan error)
+	n.mu.Unlock()
 
 	go func() {
-		if err := http.Serve(l, mux); err != nil {
-			stop <- err
-			stopReporter <- err
-			return
+		for {
+			c, _ := n.listener.Accept()
+			serv.ServeConn(c)
 		}
 	}()
 
@@ -285,12 +283,12 @@ func (n *Node) err(msg string, args ...interface{}) {
 
 func (n *Node) rpc(nodeId, rpcMethod string, args, reply interface{}) error {
 	n.mu.Lock()
-	rpcClient, ok := n.serverClients[nodeId]
-	if !ok {
-		n.mu.Unlock()
+	rpcClient := n.serverClients[nodeId]
+	n.mu.Unlock()
+
+	if rpcClient == nil {
 		return fmt.Errorf("RPC Client not initialized yet")
 	}
-	n.mu.Unlock()
 
 	return rpcClient.Call(rpcMethod, args, reply)
 }
@@ -409,18 +407,23 @@ func (n *Node) shutdown() {
 	n.currentTerm = 0
 }
 
-func (n *Node) Disconnect(nodeId string) {
+func (n *Node) Disconnect() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	c, ok := n.serverClients[nodeId]
-	if !ok {
-		return
+	err := n.listener.Close()
+	if err != nil {
+		return err
 	}
 
-	c.Close()
-
-	n.serverClients[nodeId] = nil
+	for _, id := range n.cluster {
+		if n.serverClients[id] != nil {
+			if err = n.serverClients[id].Close(); err == nil {
+				n.serverClients[id] = nil
+			}
+		}
+	}
+	return nil
 }
 
 func appendIfNotExists(servers []string, newServerId string) []string {

@@ -29,7 +29,7 @@ func retryWithBackoff(operation func() (*rpc.Client, error)) (*rpc.Client, error
 
 func RetryRPCDial(addr string) (*rpc.Client, error) {
 	a, b := retryWithBackoff(func() (*rpc.Client, error) {
-		client, err := rpc.DialHTTP("tcp", addr)
+		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
 			return nil, err
 		}
