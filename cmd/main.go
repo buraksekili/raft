@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"sync"
 
 	"github.com/buraksekili/raft"
 	"github.com/pkg/profile"
@@ -32,17 +33,30 @@ func main() {
 		nodeCluster = append(nodeCluster, n)
 	}
 
-	ch := make(chan error)
+	errc := make(chan error)
 
+	wg := &sync.WaitGroup{}
 	for _, node := range nodeCluster {
+		wg.Add(1)
 		go func(n *raft.Node) {
-			if err := n.Start(); err != nil {
-				ch <- err
+			err := n.Start()
+			wg.Done()
+			if err != nil {
+				errc <- err
 			}
 		}(node)
 	}
 
-	panic(<-ch)
+	go func() {
+		for {
+			select {
+			case err := <-errc:
+				fmt.Println("err: ", err)
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 func getNodeAddrs(n int) (res []string) {
