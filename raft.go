@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
@@ -40,6 +41,8 @@ type Node struct {
 	electionTimeout time.Duration
 	serverClients   map[string]*rpc.Client
 	listener        net.Listener
+
+	shutDownRPCServer context.CancelFunc
 }
 
 // sendRequestVote sends RequestVote RPC to other servers.
@@ -79,9 +82,7 @@ func (n *Node) sendRequestVote() {
 				n.l("sending req to %v", sId)
 				if err := n.rpc(sId, requestvoteRpcMethodname, req, res); err != nil {
 					n.err("failed to send %v to serverId: %v, err: %v", requestvoteRpcMethodname, sId, err)
-					return
 				}
-
 				n.l("received RequestVoteResponse, %+v", res)
 
 				if n.state != candidateState {
@@ -99,15 +100,13 @@ func (n *Node) sendRequestVote() {
 					if res.VoteGranted {
 						totalVotes++
 						n.l("incremented vote, new totalVotes: %v", totalVotes)
+						if totalVotes >= (len(n.cluster)+1)/2 {
+							n.l("totalVotes: %v, cluster size %v, quorum %v", totalVotes, len(n.cluster), (len(n.cluster)+1)/2)
+							n.setLeader()
+							return
+						}
 					}
 				}
-
-				if totalVotes >= (len(n.cluster)+1)/2 {
-					n.l("totalVotes: %v, cluster size %v, quorum %v", totalVotes, len(n.cluster), (len(n.cluster)+1)/2)
-					n.setLeader()
-					return
-				}
-
 				return
 			}(serverId)
 		}
@@ -116,8 +115,14 @@ func (n *Node) sendRequestVote() {
 
 func (n *Node) sendHeartbeat() {
 	n.mu.Lock()
+	if n.state != leaderState {
+		n.mu.Unlock()
+		return
+	}
+	// sending more RPC call increases memory usage.
 	t := time.NewTicker(200 * time.Millisecond)
 	defer t.Stop()
+	initialTerm := n.currentTerm
 	n.mu.Unlock()
 
 	for _, serverId := range n.cluster {
@@ -137,7 +142,7 @@ func (n *Node) sendHeartbeat() {
 				}
 
 				n.mu.Lock()
-				if res.Term > n.currentTerm {
+				if res.Term > initialTerm {
 					n.setFollower(res.Term)
 				}
 				n.mu.Unlock()
@@ -150,7 +155,9 @@ func (n *Node) sendHeartbeat() {
 // if timeout passes, start leader election. otherwise, do not start leader election.
 func (n *Node) startLeaderElection() {
 	n.mu.Lock()
+	//n.l("LOCKED startLeaderElection")
 	defer n.mu.Unlock()
+	//defer func() { n.l("UNLOCKED startLeaderElection") }()
 
 	if n.state == leaderState {
 		return
@@ -176,23 +183,42 @@ func (n *Node) start() error {
 	serv := rpc.NewServer()
 	serv.Register(n)
 
-	l, err := net.Listen("tcp", fmt.Sprintf(":%v", n.id))
+	shutDownCtx, cancel := context.WithCancel(context.Background())
+	n.shutDownRPCServer = cancel
+
+	var err error
+	n.listener, err = net.Listen("tcp", fmt.Sprintf(":%v", n.id))
 	if err != nil {
 		return err
 	}
 
-	n.listener = l
-
 	stop := make(chan error)
 	stopReporter := make(chan error)
-	n.mu.Unlock()
+	wg := &sync.WaitGroup{}
 
-	go func() {
+	wg.Add(1)
+	go func(server *rpc.Server) {
 		for {
-			c, _ := n.listener.Accept()
-			serv.ServeConn(c)
+			conn, err := n.listener.Accept()
+			if err != nil {
+				select {
+				case <-shutDownCtx.Done():
+					n.shutdown()
+					fmt.Println("shutdown context received")
+					wg.Done()
+					return
+				}
+			} else {
+				go func() {
+					wg.Add(1)
+					server.ServeConn(conn)
+					wg.Done()
+				}()
+			}
 		}
-	}()
+	}(serv)
+
+	n.mu.Unlock()
 
 	for _, nodeAddr := range n.cluster {
 		if nodeAddr != n.id {
@@ -205,6 +231,7 @@ func (n *Node) start() error {
 		}
 	}
 
+	wg.Add(1)
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
@@ -213,16 +240,18 @@ func (n *Node) start() error {
 			select {
 			case <-t.C:
 				n.report()
-			case <-stopReporter:
-				n.l("stopping reporter since the node has stopped")
+			case err := <-stopReporter:
+				n.l("stopping reporter since the node has stopped, %v", err)
 				run = false
 				break
 			}
 		}
 
+		wg.Done()
 		return
 	}()
 
+	wg.Add(1)
 	go func() {
 		n.mu.Lock()
 		n.running = true
@@ -231,16 +260,16 @@ func (n *Node) start() error {
 
 		for {
 			n.mu.Lock()
-			s := n.state
-			if n.running == false {
+			currState := n.state
+			isRunning := n.running
+			if !isRunning {
 				stopReporter <- fmt.Errorf("stopping current node %v", n.id)
-				n.shutdown()
 				n.mu.Unlock()
 				break
 			}
 			n.mu.Unlock()
 
-			switch s {
+			switch currState {
 			case followerState:
 				n.startLeaderElection()
 			case candidateState:
@@ -250,14 +279,26 @@ func (n *Node) start() error {
 			}
 		}
 
-		n.l("exiting...")
+		n.mu.Lock()
+		isRunning := n.running
+		wg.Done()
+		n.mu.Unlock()
+
+		if !isRunning {
+			stop <- n.CloseServer()
+		}
+
 		return
 	}()
+
+	wg.Wait()
 
 	return <-stop
 }
 
 func (n *Node) report() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	msg := fmt.Sprintf("[REPORT] id: %v#%v\tterm: %v",
 		n.id, n.state, n.currentTerm,
 	)
@@ -301,7 +342,7 @@ func (n *Node) setFollower(newTerm int) {
 }
 
 func (n *Node) setLeader() {
-	n.l("WON THE ELECTION")
+	n.l("becoming a leader")
 	n.state = leaderState
 	n.stateStartTime = time.Now()
 }
@@ -316,7 +357,12 @@ func (n *Node) Stop() {
 
 func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx, lastLogTerm int) (int, bool) {
 	n.mu.Lock()
+	n.l("LOCKED - processRequestVote")
 	defer n.mu.Unlock()
+	defer func() {
+		n.l("UNLOCKED - processRequestVote")
+	}()
+
 	term, voteGranted := 0, false
 
 	if candidateTerm > n.currentTerm {
@@ -407,23 +453,41 @@ func (n *Node) shutdown() {
 	n.currentTerm = 0
 }
 
-func (n *Node) Disconnect() error {
+func (n *Node) CloseServer() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	err := n.listener.Close()
-	if err != nil {
-		return err
+	fmt.Println("closing server")
+	if n.listener != nil {
+		err := n.listener.Close()
+		if err != nil {
+			return err
+		}
+		n.listener = nil
 	}
+
+	n.shutDownRPCServer()
 
 	for _, id := range n.cluster {
 		if n.serverClients[id] != nil {
-			if err = n.serverClients[id].Close(); err == nil {
+			if err := n.serverClients[id].Close(); err == nil {
 				n.serverClients[id] = nil
 			}
 		}
+
+		n.cluster = remove(n.cluster, id)
 	}
+
 	return nil
+}
+
+func remove(s []string, item string) []string {
+	for i, v := range s {
+		if v == item {
+			return append(s[:i], s[i+1:]...)
+		}
+	}
+	return s
 }
 
 func appendIfNotExists(servers []string, newServerId string) []string {
