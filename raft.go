@@ -67,23 +67,26 @@ func (n *Node) sendRequestVote() {
 	// initially is 1 since 1 vote coming from the candidate itself
 	totalVotes := 1
 
-	// Invoked by candidates to gather votes
-	req := new(RequestVoteReq)
-	req.CandidateTerm = initialTerm
-	req.CandidateId = n.id
-	req.LastLogIdx = lastLogIdx
-	req.LastLogTerm = lastLogTerm
-
-	res := new(RequestVoteRes)
-
 	for _, serverId := range n.cluster {
 		if serverId != n.id {
-			go func(sId string) {
+			// Invoked by candidates to gather votes
+			rvr := new(RequestVoteReq)
+			rvr.CandidateTerm = initialTerm
+			rvr.CandidateId = n.id
+			rvr.LastLogIdx = lastLogIdx
+			rvr.LastLogTerm = lastLogTerm
+
+			rvres := new(RequestVoteRes)
+
+			go func(sId string, req *RequestVoteReq, res *RequestVoteRes) {
 				n.l("sending req to %v", sId)
 				if err := n.rpc(sId, requestvoteRpcMethodname, req, res); err != nil {
 					n.err("failed to send %v to serverId: %v, err: %v", requestvoteRpcMethodname, sId, err)
 				}
+
+				n.mu.Lock()
 				n.l("received RequestVoteResponse, %+v", res)
+				defer n.mu.Unlock()
 
 				if n.state != candidateState {
 					n.l("i am not candidate, returning")
@@ -108,7 +111,7 @@ func (n *Node) sendRequestVote() {
 					}
 				}
 				return
-			}(serverId)
+			}(serverId, rvr, rvres)
 		}
 	}
 }
@@ -120,12 +123,13 @@ func (n *Node) sendHeartbeat() {
 		return
 	}
 	// sending more RPC call increases memory usage.
-	t := time.NewTicker(200 * time.Millisecond)
+	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
 	initialTerm := n.currentTerm
+	cluster := n.cluster
 	n.mu.Unlock()
 
-	for _, serverId := range n.cluster {
+	for _, serverId := range cluster {
 		if serverId != n.id {
 			<-t.C
 			go func(id string) {
@@ -155,9 +159,7 @@ func (n *Node) sendHeartbeat() {
 // if timeout passes, start leader election. otherwise, do not start leader election.
 func (n *Node) startLeaderElection() {
 	n.mu.Lock()
-	//n.l("LOCKED startLeaderElection")
 	defer n.mu.Unlock()
-	//defer func() { n.l("UNLOCKED startLeaderElection") }()
 
 	if n.state == leaderState {
 		return
@@ -203,7 +205,6 @@ func (n *Node) start() error {
 			if err != nil {
 				select {
 				case <-shutDownCtx.Done():
-					n.shutdown()
 					fmt.Println("shutdown context received")
 					wg.Done()
 					return
@@ -218,8 +219,6 @@ func (n *Node) start() error {
 		}
 	}(serv)
 
-	n.mu.Unlock()
-
 	for _, nodeAddr := range n.cluster {
 		if nodeAddr != n.id {
 			client, err := internal.RetryRPCDial(fmt.Sprintf("127.0.0.1:%v", nodeAddr))
@@ -230,6 +229,8 @@ func (n *Node) start() error {
 			n.serverClients[nodeAddr] = client
 		}
 	}
+
+	n.mu.Unlock()
 
 	wg.Add(1)
 	go func() {
@@ -279,15 +280,7 @@ func (n *Node) start() error {
 			}
 		}
 
-		n.mu.Lock()
-		isRunning := n.running
 		wg.Done()
-		n.mu.Unlock()
-
-		if !isRunning {
-			stop <- n.CloseServer()
-		}
-
 		return
 	}()
 
@@ -357,11 +350,7 @@ func (n *Node) Stop() {
 
 func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx, lastLogTerm int) (int, bool) {
 	n.mu.Lock()
-	n.l("LOCKED - processRequestVote")
 	defer n.mu.Unlock()
-	defer func() {
-		n.l("UNLOCKED - processRequestVote")
-	}()
 
 	term, voteGranted := 0, false
 
@@ -456,8 +445,9 @@ func (n *Node) shutdown() {
 func (n *Node) CloseServer() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.running = false
 
-	fmt.Println("closing server")
+	fmt.Println("closing server => ", n.id)
 	if n.listener != nil {
 		err := n.listener.Close()
 		if err != nil {
@@ -469,13 +459,13 @@ func (n *Node) CloseServer() error {
 	n.shutDownRPCServer()
 
 	for _, id := range n.cluster {
+		fmt.Println("updating => ", id)
 		if n.serverClients[id] != nil {
 			if err := n.serverClients[id].Close(); err == nil {
 				n.serverClients[id] = nil
 			}
 		}
 
-		n.cluster = remove(n.cluster, id)
 	}
 
 	return nil
