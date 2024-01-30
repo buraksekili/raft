@@ -281,6 +281,7 @@ func (n *Node) start() error {
 		}
 
 		wg.Done()
+		stop <- nil
 		return
 	}()
 
