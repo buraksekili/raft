@@ -24,4 +24,4 @@ go run cmd/client/main.go -addr 3000
 Removes the node that listens on 127.0.0.1:3000.
 
 ## Restrictions
-At the moment, there is no host discovery implemented. So, the program runs assuming it's running on localhost."
+At the moment, there is no host discovery implemented. So, the program runs assuming it's running on localhost.
