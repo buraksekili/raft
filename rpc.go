@@ -56,7 +56,7 @@ func (n *Node) AppendEntries(req *AppendEntriesReq, reply *AppendEntriesRes) err
 		reply = new(AppendEntriesRes)
 	}
 
-	n.processAppendEntries(req)
+	n.receiveAppendEntries(req)
 
 	return nil
 }

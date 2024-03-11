@@ -13,16 +13,9 @@ import (
 	"github.com/buraksekili/raft/internal"
 )
 
-type raftState string
 type logEntry struct {
 	Term int
 }
-
-const (
-	followerState  raftState = "follower"
-	candidateState raftState = "candidate"
-	leaderState    raftState = "leader"
-)
 
 type Node struct {
 	mu          sync.RWMutex
@@ -122,6 +115,7 @@ func (n *Node) sendHeartbeat() {
 		n.mu.Unlock()
 		return
 	}
+
 	// sending more RPC call increases memory usage.
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
@@ -397,7 +391,7 @@ func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx,
 
 // appendEntries invoked by leader to replicate log entries (§5.3); also used as heartbeat
 // RECEIVER IMPLEMENTATION.
-func (n *Node) processAppendEntries(req *AppendEntriesReq) (term int, success bool) {
+func (n *Node) receiveAppendEntries(req *AppendEntriesReq) (term int, success bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	term = n.currentTerm
@@ -420,8 +414,7 @@ func (n *Node) processAppendEntries(req *AppendEntriesReq) (term int, success bo
 
 	// 2- reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
-	process := len(n.log) > req.PrevLogIdx &&
-		n.log[req.PrevLogIdx].Term == req.PrevLogTerm
+	process := len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm
 	if !process {
 		return 0, false
 	}
