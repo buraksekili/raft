@@ -14,7 +14,8 @@ import (
 )
 
 type logEntry struct {
-	Term int
+	Term    int
+	Command interface{}
 }
 
 type Node struct {
@@ -27,6 +28,13 @@ type Node struct {
 	totalVote   int
 	running     bool
 	log         []logEntry
+
+	// Volatile state on leaders
+
+	// nextIndex is the index of the next log entry the leader will send to that follower specified in the key.
+	// (initialized to leader last log index + 1). When a leader first comes to power, it
+	// initializes all nextIndex values to the index just after the last one in its log.
+	nextIndex map[string]int
 
 	// stateStartTime corresponds to time of when this Node starts
 	// functioning as state.
@@ -117,7 +125,7 @@ func (n *Node) sendHeartbeat() {
 	}
 
 	// sending more RPC call increases memory usage.
-	t := time.NewTicker(100 * time.Millisecond)
+	t := time.NewTicker(70 * time.Millisecond)
 	defer t.Stop()
 	initialTerm := n.currentTerm
 	cluster := n.cluster
@@ -128,10 +136,21 @@ func (n *Node) sendHeartbeat() {
 			<-t.C
 			go func(id string) {
 				n.mu.Lock()
-				res := new(AppendEntriesRes)
-				req := new(AppendEntriesReq)
+				res, req := new(AppendEntriesRes), new(AppendEntriesReq)
+
+				// prepare AppendEntries RPC request
+				prevLogIdx := n.nextIndex[serverId] - 1
+				req.PrevLogIdx = prevLogIdx
+
+				prevLogTerm := -1
+				if prevLogIdx > -1 {
+					prevLogTerm = n.log[prevLogIdx].Term
+				}
+				req.PrevLogTerm = prevLogTerm
 				req.Term = n.currentTerm
 				req.LeaderID = n.id
+				req.Entries = n.log[prevLogIdx+1:]
+
 				n.mu.Unlock()
 
 				if err := n.rpc(id, appendEntriesRpcMethodname, req, res); err != nil {
@@ -140,10 +159,13 @@ func (n *Node) sendHeartbeat() {
 				}
 
 				n.mu.Lock()
+				defer n.mu.Unlock()
+
 				if res.Term > initialTerm {
 					n.setFollower(res.Term)
+					return
 				}
-				n.mu.Unlock()
+
 				return
 			}(serverId)
 		}
@@ -396,6 +418,7 @@ func (n *Node) receiveAppendEntries(req *AppendEntriesReq) (term int, success bo
 	defer n.mu.Unlock()
 	term = n.currentTerm
 
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	if req.Term > n.currentTerm {
 		n.l("found a server with greater term, becoming follower")
 		n.setFollower(req.Term)
@@ -427,6 +450,18 @@ func (n *Node) receiveAppendEntries(req *AppendEntriesReq) (term int, success bo
 	}
 
 	return 0, false
+}
+
+func (n *Node) receiveRSMCommand(command interface{}) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state == leaderState {
+		n.log = append(n.log, logEntry{Term: n.currentTerm, Command: command})
+		return true
+	}
+
+	return false
 }
 
 func (n *Node) shutdown() {
