@@ -19,22 +19,37 @@ type logEntry struct {
 }
 
 type Node struct {
-	mu          sync.RWMutex
-	id          string
+	mu        sync.RWMutex
+	id        string
+	state     raftState
+	cluster   []string
+	totalVote int
+	running   bool
+
+	/*
+		PERSISTENT STATE ON ALL SERVERS
+	*/
 	currentTerm int
-	state       raftState
 	votedFor    string
-	cluster     []string
-	totalVote   int
-	running     bool
-	log         []logEntry
+	// first index is 1 (in the paper).
+	log []logEntry
 
-	// Volatile state on leaders
+	/*
+		VOLATILE STATE ON ALL SERVERS
+	*/
+	commitIndex int
+	lastApplied int
 
+	/*
+		VOLATILE STATE ON LEADERS
+	*/
 	// nextIndex is the index of the next log entry the leader will send to that follower specified in the key.
 	// (initialized to leader last log index + 1). When a leader first comes to power, it
 	// initializes all nextIndex values to the index just after the last one in its log.
+	// it is like the length of follower's log?
 	nextIndex map[string]int
+	// matchIndex is that for each server, index of highest log entry known to be replicated on server
+	matchIndex map[string]int
 
 	// stateStartTime corresponds to time of when this Node starts
 	// functioning as state.
@@ -117,6 +132,25 @@ func (n *Node) sendRequestVote() {
 	}
 }
 
+func (n *Node) prevLogIndex(id string) int {
+	i := n.nextIndex[id] - 1
+	if i >= 0 {
+		return i
+	}
+
+	return 0
+}
+
+func (n *Node) prevLogTerm(id string) int {
+	i := n.prevLogIndex(id)
+	if i >= len(n.log) {
+		fmt.Println("prevLog is greater: ", i, len(n.log))
+		return 0
+	}
+
+	return n.log[i].Term
+}
+
 func (n *Node) sendHeartbeat() {
 	n.mu.Lock()
 	if n.state != leaderState {
@@ -136,20 +170,31 @@ func (n *Node) sendHeartbeat() {
 			<-t.C
 			go func(id string) {
 				n.mu.Lock()
-				res, req := new(AppendEntriesRes), new(AppendEntriesReq)
+				res := new(AppendEntriesRes)
 
-				// prepare AppendEntries RPC request
-				prevLogIdx := n.nextIndex[serverId] - 1
-				req.PrevLogIdx = prevLogIdx
+				prevLogIndex := n.prevLogIndex(id)
+				prevLogTerm := n.prevLogTerm(id)
 
-				prevLogTerm := -1
-				if prevLogIdx > -1 {
-					prevLogTerm = n.log[prevLogIdx].Term
+				lastEntry := min(len(n.log), n.nextIndex[id])
+				suffix := n.log[n.nextIndex[id]-1 : lastEntry]
+				lastNextIdx := n.nextIndex[id]
+				req := &AppendEntriesReq{
+					PrevLogIdx:   prevLogIndex,
+					Entries:      suffix,
+					Term:         n.currentTerm,
+					PrevLogTerm:  prevLogTerm,
+					LeaderCommit: n.commitIndex,
+					LeaderID:     n.id,
 				}
-				req.PrevLogTerm = prevLogTerm
-				req.Term = n.currentTerm
-				req.LeaderID = n.id
-				req.Entries = n.log[prevLogIdx+1:]
+
+				//fmt.Println("-------------------")
+				//fmt.Printf("log %#v=%#v\n", n.id, n.log)
+				//fmt.Println("nextIndex", n.nextIndex[id])
+				//fmt.Println("prevLogIndex", prevLogIndex)
+				//fmt.Println("prevLogTerm", prevLogTerm)
+				//fmt.Println("lastEntry", lastEntry)
+				//fmt.Println("lenLog", len(n.log))
+				//fmt.Printf("sending to #%v: %#v\n", id, *req)
 
 				n.mu.Unlock()
 
@@ -161,10 +206,44 @@ func (n *Node) sendHeartbeat() {
 				n.mu.Lock()
 				defer n.mu.Unlock()
 
+				//fmt.Printf("res: %#v\n", res)
+				//fmt.Println("-------------------")
+
+				// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 				if res.Term > initialTerm {
 					n.setFollower(res.Term)
 					return
 				}
+
+				if res.Term != req.Term && n.state == leaderState {
+					return
+				}
+
+				if res.Success {
+					//fmt.Println("success")
+					// If successful: update nextIndex and matchIndex for follower
+					//n.nextIndex[id] = lastNextIdx + len(suffix)
+					prevLogIndex, suffixLen := req.PrevLogIdx, len(suffix)
+					if prevLogIndex+suffixLen >= n.nextIndex[id] {
+						n.nextIndex[id] = prevLogIndex + suffixLen
+						n.matchIndex[id] = n.nextIndex[id] - 1
+						//fmt.Println("new ", n.nextIndex[id])
+					}
+
+					//n.nextIndex[id] = n.match
+					//n.matchIndex[id] = n.nextIndex[id] - 1
+				} else {
+					//If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+					n.nextIndex[id] = max(lastNextIdx-1, 1)
+					//fmt.Println("failure")
+				}
+
+				//for _, v := range n.cluster {
+				//	fmt.Printf("id=%v\tnextIndex=%v\n", v, n.nextIndex[v])
+				//	fmt.Printf("id=%v\tmatchIndex=%v\n", v, n.matchIndex[v])
+				//}
+
+				//fmt.Println("********************")
 
 				return
 			}(serverId)
@@ -197,6 +276,13 @@ func (n *Node) startLeaderElection() {
 func (n *Node) start() error {
 	n.mu.Lock()
 	n.cluster = appendIfNotExists(n.cluster, n.id)
+	if n.nextIndex == nil {
+		n.nextIndex = make(map[string]int)
+	}
+
+	if n.matchIndex == nil {
+		n.matchIndex = make(map[string]int)
+	}
 
 	serv := rpc.NewServer()
 	serv.Register(n)
@@ -212,6 +298,8 @@ func (n *Node) start() error {
 
 	stop := make(chan error)
 	stopReporter := make(chan error)
+
+	// we can embed wg to node, so that easily keep track of running goroutines for Node
 	wg := &sync.WaitGroup{}
 
 	wg.Add(1)
@@ -309,8 +397,8 @@ func (n *Node) start() error {
 func (n *Node) report() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	msg := fmt.Sprintf("[REPORT] id: %v#%v\tterm: %v",
-		n.id, n.state, n.currentTerm,
+	msg := fmt.Sprintf("[REPORT] id: %v#%v\tterm: %v\tlog: %#v\n",
+		n.id, n.state, n.currentTerm, n.log,
 	)
 
 	log.Printf(msg)
@@ -354,6 +442,14 @@ func (n *Node) setFollower(newTerm int) {
 func (n *Node) setLeader() {
 	n.l("becoming a leader")
 	n.state = leaderState
+	for _, id := range n.cluster {
+		if id != n.id {
+			n.nextIndex[id] = len(n.log) + 1
+			n.matchIndex[id] = 0
+		}
+	}
+
+	n.log = append(n.log, logEntry{Term: n.currentTerm, Command: nil})
 	n.stateStartTime = time.Now()
 }
 
@@ -413,7 +509,7 @@ func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx,
 
 // appendEntries invoked by leader to replicate log entries (§5.3); also used as heartbeat
 // RECEIVER IMPLEMENTATION.
-func (n *Node) receiveAppendEntries(req *AppendEntriesReq) (term int, success bool) {
+func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, success bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	term = n.currentTerm
@@ -424,32 +520,55 @@ func (n *Node) receiveAppendEntries(req *AppendEntriesReq) (term int, success bo
 		n.setFollower(req.Term)
 	}
 
-	if req.Term == n.currentTerm && (n.state == candidateState || n.state == followerState) {
+	if req.Term == n.currentTerm && n.state == candidateState {
 		n.state = followerState
 	}
 
 	// 1- Reply false if term < CurrentTerm (§5.1)
 	if req.Term < n.currentTerm {
-		return 0, false
+		fmt.Printf("terms not equal?, req: %v\tcurrent: %v\n", req.Term, n.currentTerm)
+		return n.currentTerm, false
 	}
 
 	n.stateStartTime = time.Now()
 
 	// 2- reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
-	process := len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm
-	if !process {
-		return 0, false
+	logOk := (req.PrevLogIdx == 0) ||
+		(req.PrevLogIdx > -1 && len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm)
+	//logOk := (req.PrevLogIdx == 0) ||
+	//	(req.PrevLogIdx > -1 && len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm)
+	if !logOk {
+		return n.currentTerm, false
 	}
 
-	// 3- If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that
-	// follow it (§5.3)
-	if n.log[req.PrevLogIdx].Term != req.PrevLogTerm {
-		return 0, false
+	// heartbeat
+	if len(req.Entries) == 0 {
+		return n.currentTerm, true
 	}
 
-	return 0, false
+	index := req.PrevLogIdx + 1
+	if len(n.log) >= index && n.log[index-1].Term == req.Entries[0].Term {
+		return n.currentTerm, true
+	}
+
+	if len(n.log) == req.PrevLogIdx {
+		exists := false
+		for _, e := range n.log {
+			if e.Command == req.Entries[0].Command && e.Term == req.Entries[0].Term {
+				exists = true
+				break
+			}
+		}
+
+		if !exists {
+			n.log = append(n.log, req.Entries[0])
+		}
+
+		return n.currentTerm, true
+	}
+
+	return n.currentTerm, true
 }
 
 func (n *Node) receiveRSMCommand(command interface{}) bool {
