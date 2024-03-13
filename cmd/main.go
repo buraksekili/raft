@@ -25,10 +25,9 @@ func main() {
 	}
 
 	var nodeCluster []*raft.Node
-	nodeAddrs := getNodeAddrs(*numberOfNodes)
 
-	for _, nodeAddr := range nodeAddrs {
-		n := raft.NewNode(nodeAddr, nodeAddrs)
+	for _, nodeAddr := range getNodeAddrs(*numberOfNodes) {
+		n := raft.NewNode(nodeAddr)
 		nodeCluster = append(nodeCluster, n)
 	}
 

@@ -75,7 +75,7 @@ func (n *Node) sendRequestVote() {
 		lastLogIdx = 0
 	}
 
-	if len(n.cluster) == 1 && n.cluster[0] == n.id {
+	if len(n.nodes) == 1 && n.nodes[0].id == n.id {
 		n.l("i am the only node in the cluster, becoming the leader")
 		n.setLeader()
 		return
@@ -84,8 +84,8 @@ func (n *Node) sendRequestVote() {
 	// initially is 1 since 1 vote coming from the candidate itself
 	totalVotes := 1
 
-	for _, serverId := range n.cluster {
-		if serverId != n.id {
+	for _, node := range n.nodes {
+		if node.id != n.id {
 			// Invoked by candidates to gather votes
 			rvr := new(RequestVoteReq)
 			rvr.CandidateTerm = initialTerm
@@ -120,15 +120,15 @@ func (n *Node) sendRequestVote() {
 					if res.VoteGranted {
 						totalVotes++
 						n.l("incremented vote, new totalVotes: %v", totalVotes)
-						if totalVotes >= (len(n.cluster)+1)/2 {
-							n.l("totalVotes: %v, cluster size %v, quorum %v", totalVotes, len(n.cluster), (len(n.cluster)+1)/2)
+						if totalVotes >= (len(n.nodes)+1)/2 {
+							n.l("totalVotes: %v, cluster size %v, quorum %v", totalVotes, len(n.nodes), (len(n.nodes)+1)/2)
 							n.setLeader()
 							return
 						}
 					}
 				}
 				return
-			}(serverId, rvr, rvres)
+			}(node.id, rvr, rvres)
 		}
 	}
 }
@@ -163,11 +163,11 @@ func (n *Node) sendHeartbeat() {
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
 	initialTerm := n.currentTerm
-	cluster := n.cluster
+	nodes := n.nodes
 	n.mu.Unlock()
 
-	for _, serverId := range cluster {
-		if serverId != n.id {
+	for _, node := range nodes {
+		if node.id != n.id {
 			<-t.C
 			go func(id string) {
 				n.mu.Lock()
@@ -246,7 +246,7 @@ func (n *Node) sendHeartbeat() {
 				//fmt.Println("********************")
 
 				return
-			}(serverId)
+			}(node.id)
 		}
 	}
 }
@@ -275,7 +275,6 @@ func (n *Node) startLeaderElection() {
 // start runs a new goroutine within a new infinite loop where Raft logic runs periodically (based on electionTimeout).
 func (n *Node) start() error {
 	n.mu.Lock()
-	n.cluster = appendIfNotExists(n.cluster, n.id)
 	if n.nextIndex == nil {
 		n.nextIndex = make(map[string]int)
 	}
@@ -323,14 +322,14 @@ func (n *Node) start() error {
 		}
 	}(serv)
 
-	for _, nodeAddr := range n.cluster {
-		if nodeAddr != n.id {
-			client, err := internal.RetryRPCDial(fmt.Sprintf("127.0.0.1:%v", nodeAddr))
+	for _, node := range n.nodes {
+		if node.id != n.id {
+			client, err := internal.RetryRPCDial(fmt.Sprintf("127.0.0.1:%v", node.id))
 			if err != nil {
 				return err
 			}
 
-			n.serverClients[nodeAddr] = client
+			n.serverClients[node.id] = client
 		}
 	}
 
@@ -394,11 +393,20 @@ func (n *Node) start() error {
 	return <-stop
 }
 
+func (n *Node) getaddrs() []string {
+	var a []string
+	for _, v := range n.nodes {
+		a = append(a, v.id)
+	}
+
+	return a
+}
+
 func (n *Node) report() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	msg := fmt.Sprintf("[REPORT] id: %v#%v\tterm: %v\tlog: %#v\tcluster: %#v\n",
-		n.id, n.state, n.currentTerm, n.log, n.cluster,
+	msg := fmt.Sprintf("[REPORT] id= %v#%v\tterm= %v\tcluster= %+v\tlog= %+v\n",
+		n.id, n.state, n.currentTerm, n.getaddrs(), n.log,
 	)
 
 	log.Printf(msg)
@@ -442,10 +450,10 @@ func (n *Node) setFollower(newTerm int) {
 func (n *Node) setLeader() {
 	n.l("becoming a leader")
 	n.state = leaderState
-	for _, id := range n.cluster {
-		if id != n.id {
-			n.nextIndex[id] = len(n.log) + 1
-			n.matchIndex[id] = 0
+	for _, node := range n.nodes {
+		if node.id != n.id {
+			n.nextIndex[node.id] = len(n.log) + 1
+			n.matchIndex[node.id] = 0
 		}
 	}
 
@@ -606,8 +614,9 @@ func (n *Node) CloseServer() error {
 
 	n.shutDownRPCServer()
 
-	for _, id := range n.cluster {
-		fmt.Println("updating => ", id)
+	for _, node := range n.nodes {
+		id := node.id
+		node.nodes = removeFromNodeCluster(node.nodes, n.id)
 		if n.serverClients[id] != nil {
 			if err := n.serverClients[id].Close(); err == nil {
 				n.serverClients[id] = nil
@@ -620,43 +629,20 @@ func (n *Node) CloseServer() error {
 	return nil
 }
 
-func removeFromNodeCluster(cluster []string, nid string) []string {
-	for i, v := range cluster {
-		if v == nid {
-			return append(cluster[:i], cluster[i+1:]...)
+func removeFromNodeCluster(nodes []*Node, id string) []*Node {
+	var result []*Node
+	for _, node := range nodes {
+		if node.id != id {
+			result = append(result, node)
 		}
 	}
 
-	return cluster
+	return result
 }
 
-func appendIfNotExists(servers []string, newServerId string) []string {
-	if newServerId == "" {
-		return servers
-	}
-
-	exists := false
-	for _, server := range servers {
-		if server == "" {
-			continue
-		}
-
-		if newServerId == server {
-			exists = true
-		}
-	}
-
-	if !exists {
-		servers = append(servers, newServerId)
-	}
-
-	return servers
-}
-
-func NewNode(id string, cluster []string) *Node {
+func NewNode(id string) *Node {
 	return &Node{
 		id:              id,
-		cluster:         cluster,
 		serverClients:   make(map[string]*rpc.Client),
 		electionTimeout: time.Duration(rand.Intn(400)+600) * time.Millisecond,
 		state:           followerState,
