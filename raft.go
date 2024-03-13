@@ -23,6 +23,7 @@ type Node struct {
 	id        string
 	state     raftState
 	cluster   []string
+	nodes     []*Node
 	totalVote int
 	running   bool
 
@@ -159,7 +160,7 @@ func (n *Node) sendHeartbeat() {
 	}
 
 	// sending more RPC call increases memory usage.
-	t := time.NewTicker(70 * time.Millisecond)
+	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
 	initialTerm := n.currentTerm
 	cluster := n.cluster
@@ -194,19 +195,18 @@ func (n *Node) sendHeartbeat() {
 				//fmt.Println("prevLogTerm", prevLogTerm)
 				//fmt.Println("lastEntry", lastEntry)
 				//fmt.Println("lenLog", len(n.log))
-				//fmt.Printf("sending to #%v: %#v\n", id, *req)
+				//fmt.Printf("req to #%v: %#v\n", id, *req)
 
 				n.mu.Unlock()
 
 				if err := n.rpc(id, appendEntriesRpcMethodname, req, res); err != nil {
 					n.err("failed to send %v to serverId: %v, err: %v", appendEntriesRpcMethodname, id, err)
-					return
 				}
 
 				n.mu.Lock()
 				defer n.mu.Unlock()
 
-				//fmt.Printf("res: %#v\n", res)
+				//fmt.Printf("res from %#v to %#v = %#v\n", id, n.id, res)
 				//fmt.Println("-------------------")
 
 				// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
@@ -309,7 +309,7 @@ func (n *Node) start() error {
 			if err != nil {
 				select {
 				case <-shutDownCtx.Done():
-					fmt.Println("shutdown context received")
+					fmt.Println("shutdown context received in ", n.id)
 					wg.Done()
 					return
 				}
@@ -397,8 +397,8 @@ func (n *Node) start() error {
 func (n *Node) report() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	msg := fmt.Sprintf("[REPORT] id: %v#%v\tterm: %v\tlog: %#v\n",
-		n.id, n.state, n.currentTerm, n.log,
+	msg := fmt.Sprintf("[REPORT] id: %v#%v\tterm: %v\tlog: %#v\tcluster: %#v\n",
+		n.id, n.state, n.currentTerm, n.log, n.cluster,
 	)
 
 	log.Printf(msg)
@@ -538,7 +538,8 @@ func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, succ
 		(req.PrevLogIdx > -1 && len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm)
 	//logOk := (req.PrevLogIdx == 0) ||
 	//	(req.PrevLogIdx > -1 && len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm)
-	if !logOk {
+	if req.Term != n.currentTerm || !logOk {
+		fmt.Printf("!logOK, log of %#v => %+v\n", n.id, n.log)
 		return n.currentTerm, false
 	}
 
@@ -593,7 +594,6 @@ func (n *Node) shutdown() {
 func (n *Node) CloseServer() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.running = false
 
 	fmt.Println("closing server => ", n.id)
 	if n.listener != nil {
@@ -616,16 +616,18 @@ func (n *Node) CloseServer() error {
 
 	}
 
+	n.running = false
 	return nil
 }
 
-func remove(s []string, item string) []string {
-	for i, v := range s {
-		if v == item {
-			return append(s[:i], s[i+1:]...)
+func removeFromNodeCluster(cluster []string, nid string) []string {
+	for i, v := range cluster {
+		if v == nid {
+			return append(cluster[:i], cluster[i+1:]...)
 		}
 	}
-	return s
+
+	return cluster
 }
 
 func appendIfNotExists(servers []string, newServerId string) []string {
