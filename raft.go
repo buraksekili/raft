@@ -48,6 +48,7 @@ type Node struct {
 	// (initialized to leader last log index + 1). When a leader first comes to power, it
 	// initializes all nextIndex values to the index just after the last one in its log.
 	// it is like the length of follower's log?
+	// liderin gonderecegi logdan sonraki gelen log indeksi
 	nextIndex map[string]int
 	// matchIndex is that for each server, index of highest log entry known to be replicated on server
 	matchIndex map[string]int
@@ -380,13 +381,16 @@ func (n *Node) start() error {
 			case leaderState:
 				n.sendHeartbeat()
 
-				if counter < 2 {
+				if counter < 1 {
 					go func() {
 						counter++
-						w := time.Duration(rand.Intn(6*counter)) * time.Second
+						w := time.Duration(7) * time.Second
 						fmt.Println("==> adding a log to leader after ", w)
 						time.Sleep(w)
-						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("add-%s", w.String())})
+						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("1st")})
+						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("2nd")})
+						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("3rd")})
+						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("4th")})
 						fmt.Println("==> added a log to leader")
 					}()
 				}

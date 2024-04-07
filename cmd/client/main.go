@@ -5,25 +5,41 @@ import (
 	"fmt"
 	"log"
 	"net/rpc"
+	"time"
 
 	"github.com/buraksekili/raft"
 )
 
-var f = flag.String("addr", "3000", "")
-
 func main() {
+	// Define command-line flags
+	add := flag.Bool("add", false, "Add command")
+	remove := flag.Int("remove", 1, "Remove command")
+	addr := flag.String("url", "3000", "address of leader")
 	flag.Parse()
 
-	client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%s", *f))
+	// Create a new RPC client
+	client, err := rpc.Dial("tcp", fmt.Sprintf(":%v", *addr))
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
 
-	// Call the Node.Close method
-	r := new(raft.RequestVoteReq)
-	s := new(raft.RequestVoteRes)
-	err = client.Call("Node.Close", r, s)
-	if err != nil {
-		log.Fatal("calling:", err)
+	// Call the appropriate RPC method based on the command
+	var reply raft.CmdRes
+	var req raft.CmdReq
+	if *add {
+		req.Add = true
+		req.Cmd = fmt.Sprintf("add-%v", time.Now().Second())
+		err = client.Call("Node.Add", req, &reply)
+		if err != nil {
+			log.Fatal("Node.Add error:", err)
+		}
+	} else {
+		req.Count = *remove
+		err = client.Call("Node.Add", req, &reply)
+		if err != nil {
+			log.Fatal("Node.Add error:", err)
+		}
 	}
+
+	fmt.Printf("Node.Add reply: %+v\n", reply)
 }

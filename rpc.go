@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 type RequestVoteReq struct {
 	CandidateTerm int
 	CandidateId   string
@@ -59,4 +61,39 @@ func (n *Node) AppendEntries(req *AppendEntriesReq, reply *AppendEntriesRes) err
 	reply.Term, reply.Success = n.handleAppendEntriesRequest(req)
 
 	return nil
+}
+
+type CmdReq struct {
+	Add   bool
+	Cmd   string
+	Count int
+}
+
+type CmdRes struct {
+	Res bool
+}
+
+func (n *Node) Add(req *CmdReq, reply *CmdRes) error {
+	if req.Add {
+		n.log = append(n.log, logEntry{Term: n.currentTerm, Command: req.Cmd})
+	} else {
+		if req.Count == 0 {
+			req.Count = 1
+		}
+		n.log = deleteNElementsFromEnd(n.log, req.Count)
+	}
+
+	n.l(fmt.Sprintf("===> new log: %+v", n.log))
+
+	reply.Res = true
+
+	return nil
+}
+
+func deleteNElementsFromEnd(slice []logEntry, n int) []logEntry {
+	if len(slice)-n < 1 {
+		return slice
+	}
+	slice = slice[:len(slice)-n]
+	return slice
 }
