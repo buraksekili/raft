@@ -134,18 +134,12 @@ func (n *Node) sendRequestVote() {
 }
 
 func (n *Node) prevLogIndex(id string) int {
-	i := n.nextIndex[id] - 1
-	if i >= 0 {
-		return i
-	}
-
-	return 0
+	return n.nextIndex[id] - 1
 }
 
 func (n *Node) prevLogTerm(id string) int {
 	i := n.prevLogIndex(id)
-	if i >= len(n.log) {
-		fmt.Println("prevLog is greater: ", i, len(n.log))
+	if i == -1 || len(n.log) == 0 {
 		return 0
 	}
 
@@ -176,8 +170,14 @@ func (n *Node) sendHeartbeat() {
 				prevLogIndex := n.prevLogIndex(id)
 				prevLogTerm := n.prevLogTerm(id)
 
-				lastEntry := min(len(n.log), n.nextIndex[id])
-				suffix := n.log[n.nextIndex[id]-1 : lastEntry]
+				next := n.nextIndex[id]
+
+				//lastEntry := min(len(n.log), next)
+				lastEntry := max(len(n.log), next)
+
+				suffix := []logEntry{}
+				suffix = n.log[next:lastEntry]
+
 				lastNextIdx := n.nextIndex[id]
 				req := &AppendEntriesReq{
 					PrevLogIdx:   prevLogIndex,
@@ -187,15 +187,17 @@ func (n *Node) sendHeartbeat() {
 					LeaderCommit: n.commitIndex,
 					LeaderID:     n.id,
 				}
-
-				//fmt.Println("-------------------")
-				//fmt.Printf("log %#v=%#v\n", n.id, n.log)
-				//fmt.Println("nextIndex", n.nextIndex[id])
-				//fmt.Println("prevLogIndex", prevLogIndex)
-				//fmt.Println("prevLogTerm", prevLogTerm)
-				//fmt.Println("lastEntry", lastEntry)
-				//fmt.Println("lenLog", len(n.log))
-				//fmt.Printf("req to #%v: %#v\n", id, *req)
+				if len(suffix) > 0 {
+					n.l(fmt.Sprintf("==> prevLogIdx: %v", prevLogIndex))
+					n.l(fmt.Sprintf("==> prevLogTerm: %v", prevLogTerm))
+					//n.l(fmt.Sprintf("==> lastEntry min(len(n.log), n.nextIndex[id]) = min(%v, %v): %v",
+					//	len(n.log), next, lastEntry))
+					fmt.Printf("===> sending a request for replication, %+v\n", req)
+				}
+				//if len(n.log) > 0 {
+				//	n.l(fmt.Sprintf("==> [debug]: next: %v, lastEntry: %v", next, lastEntry))
+				//	n.l(fmt.Sprintf("==> [debug]: %+v", req))
+				//}
 
 				n.mu.Unlock()
 
@@ -220,30 +222,26 @@ func (n *Node) sendHeartbeat() {
 				}
 
 				if res.Success {
-					//fmt.Println("success")
-					// If successful: update nextIndex and matchIndex for follower
-					//n.nextIndex[id] = lastNextIdx + len(suffix)
-					prevLogIndex, suffixLen := req.PrevLogIdx, len(suffix)
-					if prevLogIndex+suffixLen >= n.nextIndex[id] {
-						n.nextIndex[id] = prevLogIndex + suffixLen
-						n.matchIndex[id] = n.nextIndex[id] - 1
-						//fmt.Println("new ", n.nextIndex[id])
+					//prevLogIndex, suffixLen := req.PrevLogIdx, len(suffix)
+					//if prevLogIndex+suffixLen >= n.nextIndex[id] {
+					//	n.l(fmt.Sprintf("===> prev nextIndx: %v", n.nextIndex[id]))
+					//	n.nextIndex[id] = prevLogIndex + suffixLen
+					//	n.l(fmt.Sprintf("===> after nextIndx: %v", n.nextIndex[id]))
+					//	n.matchIndex[id] = n.nextIndex[id] - 1
+					//	//fmt.Println("new ", n.nextIndex[id])
+					//}
+
+					if len(suffix) > 0 {
+						n.nextIndex[id] += 1
 					}
 
-					//n.nextIndex[id] = n.match
-					//n.matchIndex[id] = n.nextIndex[id] - 1
 				} else {
 					//If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+					old := n.nextIndex[id]
 					n.nextIndex[id] = max(lastNextIdx-1, 1)
+					n.l(fmt.Sprintf("===> updating nextIdx of %v, from %v to %v", id, old, n.nextIndex[id]))
 					//fmt.Println("failure")
 				}
-
-				//for _, v := range n.cluster {
-				//	fmt.Printf("id=%v\tnextIndex=%v\n", v, n.nextIndex[v])
-				//	fmt.Printf("id=%v\tmatchIndex=%v\n", v, n.matchIndex[v])
-				//}
-
-				//fmt.Println("********************")
 
 				return
 			}(node.id)
@@ -360,6 +358,7 @@ func (n *Node) start() error {
 		n.mu.Lock()
 		n.running = true
 		n.stateStartTime = time.Now()
+		counter := 0
 		n.mu.Unlock()
 
 		for {
@@ -380,6 +379,17 @@ func (n *Node) start() error {
 				n.startLeaderElection()
 			case leaderState:
 				n.sendHeartbeat()
+
+				if counter < 2 {
+					go func() {
+						counter++
+						w := time.Duration(rand.Intn(6*counter)) * time.Second
+						fmt.Println("==> adding a log to leader after ", w)
+						time.Sleep(w)
+						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("add-%s", w.String())})
+						fmt.Println("==> added a log to leader")
+					}()
+				}
 			}
 		}
 
@@ -452,12 +462,12 @@ func (n *Node) setLeader() {
 	n.state = leaderState
 	for _, node := range n.nodes {
 		if node.id != n.id {
-			n.nextIndex[node.id] = len(n.log) + 1
+			n.nextIndex[node.id] = len(n.log)
 			n.matchIndex[node.id] = 0
 		}
 	}
 
-	n.log = append(n.log, logEntry{Term: n.currentTerm, Command: nil})
+	//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: nil})
 	n.stateStartTime = time.Now()
 }
 
@@ -522,59 +532,36 @@ func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, succ
 	defer n.mu.Unlock()
 	term = n.currentTerm
 
+	// 1- Reply false if term < CurrentTerm (§5.1)
+	if req.Term < n.currentTerm {
+		n.l(fmt.Sprintf("===> TERM ISSUE"))
+		return n.currentTerm, false
+	}
+
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	if req.Term > n.currentTerm {
 		n.l("found a server with greater term, becoming follower")
 		n.setFollower(req.Term)
 	}
 
-	if req.Term == n.currentTerm && n.state == candidateState {
-		n.state = followerState
+	if n.state == candidateState || n.state == leaderState {
+		n.setFollower(req.Term)
 	}
 
-	// 1- Reply false if term < CurrentTerm (§5.1)
-	if req.Term < n.currentTerm {
-		fmt.Printf("terms not equal?, req: %v\tcurrent: %v\n", req.Term, n.currentTerm)
-		return n.currentTerm, false
-	}
-
+	// reset election timeout
 	n.stateStartTime = time.Now()
 
 	// 2- reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
-	logOk := (req.PrevLogIdx == 0) ||
+	logOk := (req.PrevLogIdx == -1) ||
 		(req.PrevLogIdx > -1 && len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm)
-	//logOk := (req.PrevLogIdx == 0) ||
-	//	(req.PrevLogIdx > -1 && len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm)
-	if req.Term != n.currentTerm || !logOk {
-		fmt.Printf("!logOK, log of %#v => %+v\n", n.id, n.log)
+	if !logOk {
+		n.l(fmt.Sprintf("===> NOT OK"))
 		return n.currentTerm, false
 	}
 
-	// heartbeat
-	if len(req.Entries) == 0 {
-		return n.currentTerm, true
-	}
-
-	index := req.PrevLogIdx + 1
-	if len(n.log) >= index && n.log[index-1].Term == req.Entries[0].Term {
-		return n.currentTerm, true
-	}
-
-	if len(n.log) == req.PrevLogIdx {
-		exists := false
-		for _, e := range n.log {
-			if e.Command == req.Entries[0].Command && e.Term == req.Entries[0].Term {
-				exists = true
-				break
-			}
-		}
-
-		if !exists {
-			n.log = append(n.log, req.Entries[0])
-		}
-
-		return n.currentTerm, true
+	if len(req.Entries) > 0 {
+		n.log = append(n.log, req.Entries[0])
 	}
 
 	return n.currentTerm, true
