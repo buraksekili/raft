@@ -224,16 +224,7 @@ func (n *Node) sendHeartbeat() {
 				}
 
 				if res.Success {
-					//prevLogIndex, suffixLen := req.PrevLogIdx, len(suffix)
-					//if prevLogIndex+suffixLen >= n.nextIndex[id] {
-					//	n.l(fmt.Sprintf("===> prev nextIndx: %v", n.nextIndex[id]))
-					//	n.nextIndex[id] = prevLogIndex + suffixLen
-					//	n.l(fmt.Sprintf("===> after nextIndx: %v", n.nextIndex[id]))
-					//	n.matchIndex[id] = n.nextIndex[id] - 1
-					//	//fmt.Println("new ", n.nextIndex[id])
-					//}
-
-					if len(suffix) > 0 {
+					if req.PrevLogIdx+len(suffix) >= nextIdxForFollower {
 						// add + 1 bc prevLogIndex might be -1 when the log is empty.
 						n.nextIndex[id] = prevLogIndex + len(suffix) + 1
 					}
@@ -358,7 +349,7 @@ func (n *Node) start() error {
 		n.mu.Lock()
 		n.running = true
 		n.stateStartTime = time.Now()
-		counter := 0
+		//counter := 0
 		n.mu.Unlock()
 
 		for {
@@ -380,19 +371,26 @@ func (n *Node) start() error {
 			case leaderState:
 				n.sendHeartbeat()
 
-				if counter < 1 {
-					go func() {
-						counter++
-						w := time.Duration(3) * time.Second
-						fmt.Println("==> adding a log to leader after ", w)
-						time.Sleep(w)
-						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("1st")})
-						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("2nd")})
-						//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("3rd")})
-						//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("4th")})
-						fmt.Println("==> added a log to leader")
-					}()
-				}
+				//if counter < 1 {
+				//	go func() {
+				//		counter++
+				//		w := time.Duration(7) * time.Second
+				//		fmt.Println("==> adding a log to leader after ", w)
+				//		time.Sleep(w)
+				//		n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("1st")})
+				//		n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("2nd")})
+				//		//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("3rd")})
+				//		//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("4th")})
+				//		fmt.Println("==> added a log to leader")
+				//	}()
+				//	for _, v := range n.nodes {
+				//		if v.id == n.id {
+				//			continue
+				//		}
+				//		v.log = append(v.log, logEntry{Term: n.currentTerm, Command: "dummy" + v.id})
+				//		v.log = append(v.log, logEntry{Term: n.currentTerm, Command: "hola" + v.id})
+				//	}
+				//}
 			}
 		}
 
@@ -640,6 +638,10 @@ func removeFromNodeCluster(nodes []*Node, id string) []*Node {
 	}
 
 	return result
+}
+
+func (n *Node) SetCluster(cluster []*Node) {
+	n.nodes = cluster
 }
 
 func NewNode(id string) *Node {

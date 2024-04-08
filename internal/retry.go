@@ -8,7 +8,7 @@ import (
 
 const (
 	maxRetries = 3
-	baseDelay  = 200 * time.Millisecond
+	baseDelay  = 2000 * time.Millisecond
 )
 
 // retryWithBackoff retries the given operation with exponential backoff
