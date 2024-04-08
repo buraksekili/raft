@@ -61,6 +61,7 @@ type Node struct {
 	listener        net.Listener
 
 	shutDownRPCServer context.CancelFunc
+	logger            internal.Logger
 }
 
 // sendRequestVote sends RequestVote RPC to other servers.
@@ -77,7 +78,6 @@ func (n *Node) sendRequestVote() {
 	}
 
 	if len(n.nodes) == 1 && n.nodes[0].id == n.id {
-		n.l("i am the only node in the cluster, becoming the leader")
 		n.setLeader()
 		return
 	}
@@ -97,22 +97,20 @@ func (n *Node) sendRequestVote() {
 			rvres := new(RequestVoteRes)
 
 			go func(sId string, req *RequestVoteReq, res *RequestVoteRes) {
-				n.l("sending req to %v", sId)
+				n.info("Sending RequestVoteReq", "request", *req)
 				if err := n.rpc(sId, requestvoteRpcMethodname, req, res); err != nil {
-					n.err("failed to send %v to serverId: %v, err: %v", requestvoteRpcMethodname, sId, err)
+					return
 				}
 
 				n.mu.Lock()
-				n.l("received RequestVoteResponse, %+v", res)
+				n.info("Received RequestVoteResponse", "response", *res)
 				defer n.mu.Unlock()
 
 				if n.state != candidateState {
-					n.l("i am not candidate, returning")
 					return
 				}
 
 				if res.Term > initialTerm {
-					n.l("resp term:%v is greater than mine %v", res.Term, initialTerm)
 					n.setFollower(res.Term)
 					return
 				}
@@ -120,9 +118,7 @@ func (n *Node) sendRequestVote() {
 				if res.Term == initialTerm {
 					if res.VoteGranted {
 						totalVotes++
-						n.l("incremented vote, new totalVotes: %v", totalVotes)
 						if totalVotes >= (len(n.nodes)+1)/2 {
-							n.l("totalVotes: %v, cluster size %v, quorum %v", totalVotes, len(n.nodes), (len(n.nodes)+1)/2)
 							n.setLeader()
 							return
 						}
@@ -193,21 +189,14 @@ func (n *Node) sendHeartbeat() {
 					LeaderID:     n.id,
 				}
 				if len(suffix) > 0 {
-					//n.l(fmt.Sprintf("==> prevLogIdx: %v", prevLogIndex))
-					//n.l(fmt.Sprintf("==> prevLogTerm: %v", prevLogTerm))
-					//n.l(fmt.Sprintf("==> lastEntry min(len(n.log), n.nextIndex[id]) = min(%v, %v): %v",
-					//	len(n.log), next, lastEntry))
-					n.l(fmt.Sprintf("===> sending a request for replication to %v, %+v", id, req))
+					n.info("Replicating log", "receiver_id", id, "suffix", suffix)
 				}
-				//if len(n.log) > 0 {
-				//	n.l(fmt.Sprintf("==> [debug]: next: %v, lastEntry: %v", next, lastEntry))
-				//	n.l(fmt.Sprintf("==> [debug]: %+v", req))
-				//}
 
 				n.mu.Unlock()
 
 				if err := n.rpc(id, appendEntriesRpcMethodname, req, res); err != nil {
-					n.err("failed to send %v to serverId: %v, err: %v", appendEntriesRpcMethodname, id, err)
+					n.err("failed to send AppendEntries RPC", err, "receiverId", id)
+					return
 				}
 
 				n.mu.Lock()
@@ -230,10 +219,8 @@ func (n *Node) sendHeartbeat() {
 					}
 
 				} else {
-					//If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
-					old := n.nextIndex[id]
+					// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
 					n.nextIndex[id] = max(lastNextIdx-1, 0)
-					n.l(fmt.Sprintf("===> updating nextIdx of %v, from %v to %v", id, old, n.nextIndex[id]))
 				}
 
 				return
@@ -252,7 +239,7 @@ func (n *Node) startLeaderElection() {
 	}
 
 	if time.Since(n.stateStartTime) > n.electionTimeout {
-		n.l("election will start, t/o: %v, stateStartTime: %v", n.electionTimeout, n.stateStartTime.Format(time.TimeOnly))
+		n.info("election will start")
 		n.currentTerm++
 		n.votedFor = n.id
 		n.state = candidateState
@@ -266,6 +253,8 @@ func (n *Node) startLeaderElection() {
 // start runs a new goroutine within a new infinite loop where Raft logic runs periodically (based on electionTimeout).
 func (n *Node) start() error {
 	n.mu.Lock()
+	n.logger = internal.NewLogger(nil)
+	n.info("Initializing the server...")
 	n.initializeNextIndex()
 
 	if n.matchIndex == nil {
@@ -334,7 +323,7 @@ func (n *Node) start() error {
 			case <-t.C:
 				n.report()
 			case err := <-stopReporter:
-				n.l("stopping reporter since the node has stopped, %v", err)
+				n.err("stopping reporter since the node has stopped", err)
 				run = false
 				break
 			}
@@ -394,6 +383,7 @@ func (n *Node) start() error {
 			}
 		}
 
+		n.running = false
 		wg.Done()
 		stop <- nil
 		return
@@ -416,27 +406,23 @@ func (n *Node) getaddrs() []string {
 func (n *Node) report() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	msg := fmt.Sprintf("[REPORT] id= %v#%v\tterm= %v\tcluster= %+v\tlog= %+v\n",
-		n.id, n.state, n.currentTerm, n.getaddrs(), n.log,
-	)
-
-	log.Printf(msg)
+	n.logger.Report("", "id", n.id, "state", n.state, "log", fmt.Sprintf("%+v", n.log))
 }
 
-func (n *Node) l(msg string, args ...interface{}) {
-	msg = fmt.Sprintf("id: %v#%v\tterm %v\tmsg: %v\n",
-		n.id, n.state, n.currentTerm, msg,
-	)
-
-	log.Printf(msg, args...)
+func (n *Node) info(msg string, args ...interface{}) {
+	n.logger.Info(msg, append(args, "id", n.id, "state", n.state)...)
 }
 
-func (n *Node) err(msg string, args ...interface{}) {
-	msg = fmt.Sprintf("[ERROR] id: #%v\tstate: %v\tterm: %v\tmsg: %v\n",
-		n.id, n.state, n.currentTerm, msg,
-	)
+func (n *Node) err(msg string, err error, args ...interface{}) {
+	keys := ""
+	for i := 0; i < len(args); i += 2 {
+		key := args[i]
+		value := args[i+1]
 
-	log.Printf(msg, args...)
+		keys = fmt.Sprintf("%v %v=%v ", keys, key, value)
+	}
+
+	log.Printf("ERROR %v %verror=%s", msg, keys, err)
 }
 
 func (n *Node) rpc(nodeId, rpcMethod string, args, reply interface{}) error {
@@ -459,7 +445,7 @@ func (n *Node) setFollower(newTerm int) {
 }
 
 func (n *Node) setLeader() {
-	n.l("becoming a leader")
+	n.info("becoming a leader")
 	n.state = leaderState
 	for _, node := range n.nodes {
 		if node.id != n.id {
@@ -483,6 +469,8 @@ func (n *Node) Stop() {
 func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx, lastLogTerm int) (int, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	n.info("Received RequestVote RPC", "candidateId", candidateId)
 
 	term, voteGranted := 0, false
 
@@ -535,13 +523,11 @@ func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, succ
 
 	// 1- Reply false if term < CurrentTerm (§5.1)
 	if req.Term < n.currentTerm {
-		n.l(fmt.Sprintf("===> TERM ISSUE"))
 		return n.currentTerm, false
 	}
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	if req.Term > n.currentTerm {
-		n.l("found a server with greater term, becoming follower")
 		n.setFollower(req.Term)
 	}
 
@@ -587,7 +573,7 @@ func (n *Node) receiveRSMCommand(command interface{}) bool {
 }
 
 func (n *Node) shutdown() {
-	n.l("shutting down...")
+	n.info("shutting down...")
 	n.running = false
 	n.state = followerState
 	n.currentTerm = 0
