@@ -35,6 +35,7 @@ func main() {
 		}
 	} else {
 		req.Count = *remove
+		// creates inconsistency
 		err = client.Call("Node.Add", req, &reply)
 		if err != nil {
 			log.Fatal("Node.Add error:", err)
