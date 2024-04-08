@@ -28,7 +28,7 @@ func main() {
 	var req raft.CmdReq
 	if *add {
 		req.Add = true
-		req.Cmd = fmt.Sprintf("add-%v", time.Now().Second())
+		req.Cmd = fmt.Sprintf("add-%v", time.Now().Nanosecond())
 		err = client.Call("Node.Add", req, &reply)
 		if err != nil {
 			log.Fatal("Node.Add error:", err)
