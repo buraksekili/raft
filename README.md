@@ -5,7 +5,7 @@
 Implemented leader election based on the RAFT algorithm. Simple test scenarios can be found in the test file.
 
 ## Log Replication
-Not yet started; will work on it after leader election.
+WIP
 
 ## Safety
 Not yet started; will work on it after log replication.
