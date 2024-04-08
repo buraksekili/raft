@@ -171,13 +171,17 @@ func (n *Node) sendHeartbeat() {
 				prevLogIndex := n.prevLogIndex(id)
 				prevLogTerm := n.prevLogTerm(id)
 
-				next := n.nextIndex[id]
+				nextIdxForFollower := n.nextIndex[id]
+				lastLogIdx := len(n.log)
 
 				//lastEntry := min(len(n.log), next)
-				lastEntry := max(len(n.log), next)
+				//lastEntry := max(len(n.log), nextIdxForFollower)
 
 				suffix := []logEntry{}
-				suffix = n.log[next:lastEntry]
+				if lastLogIdx >= nextIdxForFollower {
+					suffix = n.log[nextIdxForFollower:]
+				}
+				//suffix = n.log[nextIdxForFollower:lastEntry]
 
 				lastNextIdx := n.nextIndex[id]
 				req := &AppendEntriesReq{
@@ -189,11 +193,11 @@ func (n *Node) sendHeartbeat() {
 					LeaderID:     n.id,
 				}
 				if len(suffix) > 0 {
-					n.l(fmt.Sprintf("==> prevLogIdx: %v", prevLogIndex))
-					n.l(fmt.Sprintf("==> prevLogTerm: %v", prevLogTerm))
+					//n.l(fmt.Sprintf("==> prevLogIdx: %v", prevLogIndex))
+					//n.l(fmt.Sprintf("==> prevLogTerm: %v", prevLogTerm))
 					//n.l(fmt.Sprintf("==> lastEntry min(len(n.log), n.nextIndex[id]) = min(%v, %v): %v",
 					//	len(n.log), next, lastEntry))
-					fmt.Printf("===> sending a request for replication, %+v\n", req)
+					n.l(fmt.Sprintf("===> sending a request for replication to %v, %+v", id, req))
 				}
 				//if len(n.log) > 0 {
 				//	n.l(fmt.Sprintf("==> [debug]: next: %v, lastEntry: %v", next, lastEntry))
@@ -208,9 +212,6 @@ func (n *Node) sendHeartbeat() {
 
 				n.mu.Lock()
 				defer n.mu.Unlock()
-
-				//fmt.Printf("res from %#v to %#v = %#v\n", id, n.id, res)
-				//fmt.Println("-------------------")
 
 				// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 				if res.Term > initialTerm {
@@ -233,15 +234,15 @@ func (n *Node) sendHeartbeat() {
 					//}
 
 					if len(suffix) > 0 {
-						n.nextIndex[id] += 1
+						// add + 1 bc prevLogIndex might be -1 when the log is empty.
+						n.nextIndex[id] = prevLogIndex + len(suffix) + 1
 					}
 
 				} else {
 					//If AppendEntries fails because of log inconsistency: decrement nextIndex and retry
 					old := n.nextIndex[id]
-					n.nextIndex[id] = max(lastNextIdx-1, 1)
+					n.nextIndex[id] = max(lastNextIdx-1, 0)
 					n.l(fmt.Sprintf("===> updating nextIdx of %v, from %v to %v", id, old, n.nextIndex[id]))
-					//fmt.Println("failure")
 				}
 
 				return
@@ -274,9 +275,7 @@ func (n *Node) startLeaderElection() {
 // start runs a new goroutine within a new infinite loop where Raft logic runs periodically (based on electionTimeout).
 func (n *Node) start() error {
 	n.mu.Lock()
-	if n.nextIndex == nil {
-		n.nextIndex = make(map[string]int)
-	}
+	n.initializeNextIndex()
 
 	if n.matchIndex == nil {
 		n.matchIndex = make(map[string]int)
@@ -384,13 +383,13 @@ func (n *Node) start() error {
 				if counter < 1 {
 					go func() {
 						counter++
-						w := time.Duration(7) * time.Second
+						w := time.Duration(3) * time.Second
 						fmt.Println("==> adding a log to leader after ", w)
 						time.Sleep(w)
 						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("1st")})
 						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("2nd")})
-						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("3rd")})
-						n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("4th")})
+						//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("3rd")})
+						//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("4th")})
 						fmt.Println("==> added a log to leader")
 					}()
 				}
@@ -560,12 +559,18 @@ func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, succ
 	logOk := (req.PrevLogIdx == -1) ||
 		(req.PrevLogIdx > -1 && len(n.log) > req.PrevLogIdx && n.log[req.PrevLogIdx].Term == req.PrevLogTerm)
 	if !logOk {
-		n.l(fmt.Sprintf("===> NOT OK"))
 		return n.currentTerm, false
 	}
 
-	if len(req.Entries) > 0 {
-		n.log = append(n.log, req.Entries[0])
+	// even hearbeats need to include consistency check
+	for i, entry := range req.Entries {
+		idx := req.PrevLogIdx + i + 1
+		//if idx < len(n.log) && n.log[idx].Term != entry.Term {
+		if idx < len(n.log) {
+			n.log = n.log[:idx]
+		}
+		n.log = append(n.log, entry)
+		//n.log[idx] = entry
 	}
 
 	return n.currentTerm, true
@@ -618,6 +623,12 @@ func (n *Node) CloseServer() error {
 
 	n.running = false
 	return nil
+}
+
+func (n *Node) initializeNextIndex() {
+	if n.nextIndex == nil {
+		n.nextIndex = make(map[string]int)
+	}
 }
 
 func removeFromNodeCluster(nodes []*Node, id string) []*Node {
