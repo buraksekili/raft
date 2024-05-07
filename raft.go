@@ -32,8 +32,8 @@ type Node struct {
 	*/
 	currentTerm int
 	votedFor    string
-	// first index is 1 (in the paper).
-	log []logEntry
+	log         []logEntry // first index is 1 (in the paper).
+	persistence Persistence
 
 	/*
 		VOLATILE STATE ON ALL SERVERS
@@ -57,7 +57,7 @@ type Node struct {
 	// functioning as state.
 	stateStartTime  time.Time
 	electionTimeout time.Duration
-	serverClients   map[string]*rpc.Client
+	serverClients   map[string]*RpcClientWithRetry
 	listener        net.Listener
 
 	shutDownRPCServer context.CancelFunc
@@ -110,6 +110,12 @@ func (n *Node) sendRequestVote() {
 					return
 				}
 
+				// if the response sent by any of node includes a greater term, then fall back to follower.
+				// assume that your cluster contains 3 nodes at term 1. If one of the follower crashes and restarts
+				// again, it might send a RequestVoteRPC before receiving an AppendEntry RPC.
+				// As the follower's initialTerm is 1 (as the term is incremented before starting RequestVote RPCs)
+				// while the leader's term is also 1, you might need to consider what happens
+				// sent and the current leader's term is also 1.
 				if res.Term > initialTerm {
 					n.setFollower(res.Term)
 					return
@@ -150,7 +156,6 @@ func (n *Node) sendHeartbeat() {
 		return
 	}
 
-	// sending more RPC call increases memory usage.
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
 	initialTerm := n.currentTerm
@@ -253,8 +258,24 @@ func (n *Node) startLeaderElection() {
 // start runs a new goroutine within a new infinite loop where Raft logic runs periodically (based on electionTimeout).
 func (n *Node) start() error {
 	n.mu.Lock()
+	storage, err := NewBoltDBStorage(fmt.Sprintf("node-%v.db", n.id))
+	if err != nil {
+		return err
+	}
+	n.persistence = storage
+
 	n.logger = internal.NewLogger(nil)
 	n.info("Initializing the server...")
+
+	if n.persistence.HasData() {
+
+		n.logger.Info("=> prev we already have info", "prevTerm", n.currentTerm)
+		n.restoreFromStorage()
+		n.logger.Info("we already have info", "afterTerm", n.currentTerm)
+	} else {
+		n.persist()
+	}
+
 	n.initializeNextIndex()
 
 	if n.matchIndex == nil {
@@ -267,7 +288,6 @@ func (n *Node) start() error {
 	shutDownCtx, cancel := context.WithCancel(context.Background())
 	n.shutDownRPCServer = cancel
 
-	var err error
 	n.listener, err = net.Listen("tcp", fmt.Sprintf(":%v", n.id))
 	if err != nil {
 		return err
@@ -302,12 +322,7 @@ func (n *Node) start() error {
 
 	for _, node := range n.nodes {
 		if node.id != n.id {
-			client, err := internal.RetryRPCDial(fmt.Sprintf("127.0.0.1:%v", node.id))
-			if err != nil {
-				return err
-			}
-
-			n.serverClients[node.id] = client
+			n.serverClients[node.id] = rpcClientWithRetry(fmt.Sprintf("127.0.0.1:%v", node.id))
 		}
 	}
 
@@ -359,27 +374,6 @@ func (n *Node) start() error {
 				n.startLeaderElection()
 			case leaderState:
 				n.sendHeartbeat()
-
-				//if counter < 1 {
-				//	go func() {
-				//		counter++
-				//		w := time.Duration(7) * time.Second
-				//		fmt.Println("==> adding a log to leader after ", w)
-				//		time.Sleep(w)
-				//		n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("1st")})
-				//		n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("2nd")})
-				//		//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("3rd")})
-				//		//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: fmt.Sprintf("4th")})
-				//		fmt.Println("==> added a log to leader")
-				//	}()
-				//	for _, v := range n.nodes {
-				//		if v.id == n.id {
-				//			continue
-				//		}
-				//		v.log = append(v.log, logEntry{Term: n.currentTerm, Command: "dummy" + v.id})
-				//		v.log = append(v.log, logEntry{Term: n.currentTerm, Command: "hola" + v.id})
-				//	}
-				//}
 			}
 		}
 
@@ -406,7 +400,7 @@ func (n *Node) getaddrs() []string {
 func (n *Node) report() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.logger.Report("", "id", n.id, "state", n.state, "log", fmt.Sprintf("%+v", n.log))
+	n.logger.Report("", "id", n.id, "term", n.currentTerm, "state", n.state, "log", fmt.Sprintf("%+v", n.log))
 }
 
 func (n *Node) info(msg string, args ...interface{}) {
@@ -482,6 +476,7 @@ func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx,
 	}
 
 	if candidateTerm < n.currentTerm {
+		n.persist()
 		return n.currentTerm, false
 	}
 
@@ -510,6 +505,7 @@ func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx,
 	}
 
 	term = n.currentTerm
+	n.persist()
 
 	return term, voteGranted
 }
@@ -546,30 +542,21 @@ func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, succ
 		return n.currentTerm, false
 	}
 
-	// even hearbeats need to include consistency check
+	var entryExists = false
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIdx + i + 1
-		//if idx < len(n.log) && n.log[idx].Term != entry.Term {
 		if idx < len(n.log) {
 			n.log = n.log[:idx]
 		}
 		n.log = append(n.log, entry)
-		//n.log[idx] = entry
+		entryExists = true
+	}
+
+	if entryExists {
+		n.persist()
 	}
 
 	return n.currentTerm, true
-}
-
-func (n *Node) receiveRSMCommand(command interface{}) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.state == leaderState {
-		n.log = append(n.log, logEntry{Term: n.currentTerm, Command: command})
-		return true
-	}
-
-	return false
 }
 
 func (n *Node) shutdown() {
@@ -633,12 +620,8 @@ func (n *Node) SetCluster(cluster []*Node) {
 func NewNode(id string) *Node {
 	return &Node{
 		id:              id,
-		serverClients:   make(map[string]*rpc.Client),
+		serverClients:   make(map[string]*RpcClientWithRetry),
 		electionTimeout: time.Duration(rand.Intn(400)+600) * time.Millisecond,
 		state:           followerState,
 	}
-}
-
-func getRandomDuration(intervalMin, intervalMax int) time.Duration {
-	return time.Duration(rand.Intn(intervalMin)+intervalMax) * time.Millisecond
 }
