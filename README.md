@@ -2,7 +2,7 @@
 
 ## Leader Election
 
-Implemented leader election based on the RAFT algorithm. Simple test scenarios can be found in the test file.
+Implemented leader election based on the RAFT algorithm.
 
 ## Log Replication
 (wip) Simple log replication added.
