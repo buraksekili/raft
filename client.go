@@ -51,11 +51,13 @@ func (rpcClient *RpcClientWithRetry) Call(serviceMethod string, args interface{}
 		// rpc.Client for a subsequent reconnect.
 		return rpcClient.rpc.Call(serviceMethod, args, reply)
 	}
+
 	if err = dialCall(); err == rpc.ErrShutdown {
 		rpcClient.rpc.Close()
 		rpcClient.rpc = nil
 		err = dialCall()
 	}
+
 	return err
 }
 

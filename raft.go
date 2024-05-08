@@ -97,16 +97,17 @@ func (n *Node) sendRequestVote() {
 			rvres := new(RequestVoteRes)
 
 			go func(sId string, req *RequestVoteReq, res *RequestVoteRes) {
-				n.info("Sending RequestVoteReq", "request", *req)
+				n.info("Sending RequestVoteReq", "request", *req, "peer", sId)
 				if err := n.rpc(sId, requestvoteRpcMethodname, req, res); err != nil {
 					return
 				}
 
 				n.mu.Lock()
-				n.info("Received RequestVoteResponse", "response", *res)
 				defer n.mu.Unlock()
+				n.info("Received RequestVoteResponse", "response", *res)
 
 				if n.state != candidateState {
+					n.info("i am not candidate anymore", "myState", n.state)
 					return
 				}
 
@@ -117,11 +118,10 @@ func (n *Node) sendRequestVote() {
 				// while the leader's term is also 1, you might need to consider what happens
 				// sent and the current leader's term is also 1.
 				if res.Term > initialTerm {
+					n.info("=> becoming follower")
 					n.setFollower(res.Term)
 					return
-				}
-
-				if res.Term == initialTerm {
+				} else if res.Term == initialTerm {
 					if res.VoteGranted {
 						totalVotes++
 						if totalVotes >= (len(n.nodes)+1)/2 {
@@ -156,7 +156,7 @@ func (n *Node) sendHeartbeat() {
 		return
 	}
 
-	t := time.NewTicker(50 * time.Millisecond)
+	t := time.NewTicker(25 * time.Millisecond)
 	defer t.Stop()
 	initialTerm := n.currentTerm
 	nodes := n.nodes
@@ -164,7 +164,6 @@ func (n *Node) sendHeartbeat() {
 
 	for _, node := range nodes {
 		if node.id != n.id {
-			<-t.C
 			go func(id string) {
 				n.mu.Lock()
 				res := new(AppendEntriesRes)
@@ -175,14 +174,10 @@ func (n *Node) sendHeartbeat() {
 				nextIdxForFollower := n.nextIndex[id]
 				lastLogIdx := len(n.log)
 
-				//lastEntry := min(len(n.log), next)
-				//lastEntry := max(len(n.log), nextIdxForFollower)
-
 				suffix := []logEntry{}
 				if lastLogIdx >= nextIdxForFollower {
 					suffix = n.log[nextIdxForFollower:]
 				}
-				//suffix = n.log[nextIdxForFollower:lastEntry]
 
 				lastNextIdx := n.nextIndex[id]
 				req := &AppendEntriesReq{
@@ -193,20 +188,18 @@ func (n *Node) sendHeartbeat() {
 					LeaderCommit: n.commitIndex,
 					LeaderID:     n.id,
 				}
+
 				if len(suffix) > 0 {
 					n.info("Replicating log", "receiver_id", id, "suffix", suffix)
 				}
-
 				n.mu.Unlock()
 
 				if err := n.rpc(id, appendEntriesRpcMethodname, req, res); err != nil {
-					n.err("failed to send AppendEntries RPC", err, "receiverId", id)
 					return
 				}
 
 				n.mu.Lock()
 				defer n.mu.Unlock()
-
 				// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 				if res.Term > initialTerm {
 					n.setFollower(res.Term)
@@ -230,6 +223,8 @@ func (n *Node) sendHeartbeat() {
 
 				return
 			}(node.id)
+
+			<-t.C
 		}
 	}
 }
@@ -258,6 +253,9 @@ func (n *Node) startLeaderElection() {
 // start runs a new goroutine within a new infinite loop where Raft logic runs periodically (based on electionTimeout).
 func (n *Node) start() error {
 	n.mu.Lock()
+	serv := rpc.NewServer()
+	serv.Register(n)
+
 	storage, err := NewBoltDBStorage(fmt.Sprintf("node-%v.db", n.id))
 	if err != nil {
 		return err
@@ -268,12 +266,8 @@ func (n *Node) start() error {
 	n.info("Initializing the server...")
 
 	if n.persistence.HasData() {
-
-		n.logger.Info("=> prev we already have info", "prevTerm", n.currentTerm)
 		n.restoreFromStorage()
 		n.logger.Info("we already have info", "afterTerm", n.currentTerm)
-	} else {
-		n.persist()
 	}
 
 	n.initializeNextIndex()
@@ -281,9 +275,6 @@ func (n *Node) start() error {
 	if n.matchIndex == nil {
 		n.matchIndex = make(map[string]int)
 	}
-
-	serv := rpc.NewServer()
-	serv.Register(n)
 
 	shutDownCtx, cancel := context.WithCancel(context.Background())
 	n.shutDownRPCServer = cancel
@@ -404,7 +395,7 @@ func (n *Node) report() {
 }
 
 func (n *Node) info(msg string, args ...interface{}) {
-	n.logger.Info(msg, append(args, "id", n.id, "state", n.state)...)
+	n.logger.Info(msg, append(args, "term", n.currentTerm, "id", n.id, "state", n.state)...)
 }
 
 func (n *Node) err(msg string, err error, args ...interface{}) {
@@ -424,10 +415,6 @@ func (n *Node) rpc(nodeId, rpcMethod string, args, reply interface{}) error {
 	rpcClient := n.serverClients[nodeId]
 	n.mu.Unlock()
 
-	if rpcClient == nil {
-		return fmt.Errorf("RPC Client not initialized yet")
-	}
-
 	return rpcClient.Call(rpcMethod, args, reply)
 }
 
@@ -439,7 +426,6 @@ func (n *Node) setFollower(newTerm int) {
 }
 
 func (n *Node) setLeader() {
-	n.info("becoming a leader")
 	n.state = leaderState
 	for _, node := range n.nodes {
 		if node.id != n.id {
@@ -448,8 +434,8 @@ func (n *Node) setLeader() {
 		}
 	}
 
-	//n.log = append(n.log, logEntry{Term: n.currentTerm, Command: nil})
 	n.stateStartTime = time.Now()
+	n.info("became the leader")
 }
 
 func (n *Node) Start() error {
@@ -460,7 +446,7 @@ func (n *Node) Stop() {
 	n.running = false
 }
 
-func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx, lastLogTerm int) (int, bool) {
+func (n *Node) handleRequestVote(candidateId string, candidateTerm, lastLogIdx, lastLogTerm int) (int, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -473,11 +459,6 @@ func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx,
 		n.currentTerm = candidateTerm
 		n.votedFor = ""
 		n.stateStartTime = time.Now()
-	}
-
-	if candidateTerm < n.currentTerm {
-		n.persist()
-		return n.currentTerm, false
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
@@ -504,18 +485,21 @@ func (n *Node) processRequestVote(candidateId string, candidateTerm, lastLogIdx,
 		n.stateStartTime = time.Now()
 	}
 
-	term = n.currentTerm
 	n.persist()
+	term = n.currentTerm
 
 	return term, voteGranted
 }
 
 // appendEntries invoked by leader to replicate log entries (§5.3); also used as heartbeat
-// RECEIVER IMPLEMENTATION.
 func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, success bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	term = n.currentTerm
+
+	if n.state == candidateState || n.state == leaderState {
+		n.setFollower(req.Term)
+	}
 
 	// 1- Reply false if term < CurrentTerm (§5.1)
 	if req.Term < n.currentTerm {
@@ -524,10 +508,6 @@ func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, succ
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	if req.Term > n.currentTerm {
-		n.setFollower(req.Term)
-	}
-
-	if n.state == candidateState || n.state == leaderState {
 		n.setFollower(req.Term)
 	}
 
@@ -542,58 +522,17 @@ func (n *Node) handleAppendEntriesRequest(req *AppendEntriesReq) (term int, succ
 		return n.currentTerm, false
 	}
 
-	var entryExists = false
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIdx + i + 1
 		if idx < len(n.log) {
 			n.log = n.log[:idx]
 		}
 		n.log = append(n.log, entry)
-		entryExists = true
 	}
 
-	if entryExists {
-		n.persist()
-	}
+	n.persist()
 
 	return n.currentTerm, true
-}
-
-func (n *Node) shutdown() {
-	n.info("shutting down...")
-	n.running = false
-	n.state = followerState
-	n.currentTerm = 0
-}
-
-func (n *Node) CloseServer() error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	fmt.Println("closing server => ", n.id)
-	if n.listener != nil {
-		err := n.listener.Close()
-		if err != nil {
-			return err
-		}
-		n.listener = nil
-	}
-
-	n.shutDownRPCServer()
-
-	for _, node := range n.nodes {
-		id := node.id
-		node.nodes = removeFromNodeCluster(node.nodes, n.id)
-		if n.serverClients[id] != nil {
-			if err := n.serverClients[id].Close(); err == nil {
-				n.serverClients[id] = nil
-			}
-		}
-
-	}
-
-	n.running = false
-	return nil
 }
 
 func (n *Node) initializeNextIndex() {

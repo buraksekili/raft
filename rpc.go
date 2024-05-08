@@ -33,17 +33,8 @@ const (
 	appendEntriesRpcMethodname = "Node.AppendEntries"
 )
 
-func (n *Node) Close(req *RequestVoteReq, reply *RequestVoteRes) error {
-	err := n.CloseServer()
-	if err != nil {
-		n.err("failed to disconnect, err: %v", err)
-	}
-
-	return nil
-}
-
 func (n *Node) RequestVote(req *RequestVoteReq, reply *RequestVoteRes) error {
-	currentTerm, voteGranted := n.processRequestVote(req.CandidateId, req.CandidateTerm, req.LastLogIdx, req.LastLogTerm)
+	currentTerm, voteGranted := n.handleRequestVote(req.CandidateId, req.CandidateTerm, req.LastLogIdx, req.LastLogTerm)
 
 	reply.Term = currentTerm
 	reply.VoteGranted = voteGranted
