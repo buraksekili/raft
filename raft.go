@@ -541,17 +541,6 @@ func (n *Node) initializeNextIndex() {
 	}
 }
 
-func removeFromNodeCluster(nodes []*Node, id string) []*Node {
-	var result []*Node
-	for _, node := range nodes {
-		if node.id != id {
-			result = append(result, node)
-		}
-	}
-
-	return result
-}
-
 func (n *Node) SetCluster(cluster []*Node) {
 	n.nodes = cluster
 }
