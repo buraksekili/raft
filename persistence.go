@@ -71,7 +71,7 @@ func (s *BoltDBStorage) Get(key string) ([]byte, bool) {
 	return value, value != nil
 }
 
-// HasData checks if there is any data in the storage.
+// HasData checks if there is any data in the persistence.
 func (s *BoltDBStorage) HasData() bool {
 	if v, found := s.Get(currentTermKey); found {
 		return v != nil
@@ -86,7 +86,7 @@ func (s *BoltDBStorage) HasData() bool {
 }
 
 func (n *Node) restoreFromStorage() {
-	if termData, found := n.storage.Get(currentTermKey); found {
+	if termData, found := n.persistence.Get(currentTermKey); found {
 		d := gob.NewDecoder(bytes.NewBuffer(termData))
 		if err := d.Decode(&n.currentTerm); err != nil {
 			log.Fatal(err)
@@ -94,7 +94,7 @@ func (n *Node) restoreFromStorage() {
 	} else {
 		log.Fatal("currentTerm not found in storage")
 	}
-	if votedData, found := n.storage.Get(votedForKey); found {
+	if votedData, found := n.persistence.Get(votedForKey); found {
 		d := gob.NewDecoder(bytes.NewBuffer(votedData))
 		if err := d.Decode(&n.votedFor); err != nil {
 			log.Fatal(err)
@@ -102,7 +102,7 @@ func (n *Node) restoreFromStorage() {
 	} else {
 		log.Fatal("votedFor not found in storage")
 	}
-	if logData, found := n.storage.Get(logKey); found {
+	if logData, found := n.persistence.Get(logKey); found {
 		d := gob.NewDecoder(bytes.NewBuffer(logData))
 		if err := d.Decode(&n.log); err != nil {
 			log.Fatal(err)
@@ -117,17 +117,17 @@ func (n *Node) persist() {
 	if err := gob.NewEncoder(&termData).Encode(n.currentTerm); err != nil {
 		log.Fatal(err)
 	}
-	n.storage.Set(currentTermKey, termData.Bytes())
+	n.persistence.Set(currentTermKey, termData.Bytes())
 
 	var votedData bytes.Buffer
 	if err := gob.NewEncoder(&votedData).Encode(n.votedFor); err != nil {
 		log.Fatal(err)
 	}
-	n.storage.Set(votedForKey, votedData.Bytes())
+	n.persistence.Set(votedForKey, votedData.Bytes())
 
 	var logData bytes.Buffer
 	if err := gob.NewEncoder(&logData).Encode(n.log); err != nil {
 		log.Fatal(err)
 	}
-	n.storage.Set(logKey, logData.Bytes())
+	n.persistence.Set(logKey, logData.Bytes())
 }
